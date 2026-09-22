@@ -466,6 +466,14 @@ func (r *GarageBucketReconciler) validatedCOSIRetain(ctx context.Context, bucket
 func (r *GarageBucketReconciler) reconcileBucket(ctx context.Context, bucket *garagev1beta1.GarageBucket, garageClient *garage.Client) (*garage.Bucket, error) {
 	log := logf.FromContext(ctx)
 
+	// Exclusive ownership must be settled before any remote mutation or status
+	// persistence: a losing duplicate claimant must never gain the recorded
+	// identity that its deletion finalizer would later use to remove the
+	// rightful owner's bucket.
+	if err := r.ensureExclusiveBucketClaim(ctx, bucket); err != nil {
+		return nil, err
+	}
+
 	alias := bucket.Name
 	if bucket.Spec.GlobalAlias != "" {
 		alias = bucket.Spec.GlobalAlias
@@ -518,6 +526,18 @@ func (r *GarageBucketReconciler) reconcileBucket(ctx context.Context, bucket *ga
 
 func (r *GarageBucketReconciler) getOrCreateBucket(ctx context.Context, bucket *garagev1beta1.GarageBucket, garageClient *garage.Client, alias string) (*garage.Bucket, error) {
 	log := logf.FromContext(ctx)
+
+	// spec.bucketId and status.bucketId are two records of the same mapping.
+	// Admission keeps them equal, so a disagreement here means status was
+	// edited out-of-band. Fail closed instead of silently re-pointing the
+	// resource at a different bucket.
+	if bucket.Spec.BucketID != "" && bucket.Status.BucketID != "" &&
+		bucket.Spec.BucketID != bucket.Status.BucketID {
+		return nil, fmt.Errorf(
+			"spec.bucketId %q disagrees with recorded status.bucketId %q; restore the recorded identity or fix spec.bucketId before reconciling",
+			bucket.Spec.BucketID, bucket.Status.BucketID,
+		)
+	}
 
 	// COSI's UID-bound reservation alias fences its remote create; Bind then
 	// persists status.bucketId. The annotation is a handoff consistency check,
@@ -587,6 +607,7 @@ func (r *GarageBucketReconciler) getOrCreateBucket(ctx context.Context, bucket *
 	// Treating transient errors as "not found" is what caused duplicate
 	// buckets to be created during Garage cluster recovery.
 	if bucket.Status.BucketID != "" {
+		prevTrackedID := bucket.Status.BucketID
 		existing, err := getBucketWithTimeout(ctx, garageClient, garage.GetBucketRequest{ID: bucket.Status.BucketID})
 		if err == nil {
 			return existing, nil
@@ -600,8 +621,12 @@ func (r *GarageBucketReconciler) getOrCreateBucket(ctx context.Context, bucket *
 		if bucket.Annotations[garagev1beta1.AnnotationCOSIBucketID] != "" {
 			return nil, fmt.Errorf("COSI-bound bucket ID %s no longer exists; refusing ordinary alias fallback or replacement creation", bucket.Status.BucketID)
 		}
-		// Genuine 404 — bucket was deleted; fall through to alias lookup.
-		log.Info("Tracked bucket ID not found, falling back to alias lookup", "bucketID", bucket.Status.BucketID, "alias", alias)
+		// Genuine 404 — the bucket is gone from Garage. Release the recorded
+		// claim so this resource (and any resource adopting the same ID by
+		// spec.bucketId) is not wedged on a stale identity, then fall through
+		// to alias lookup. reconcileBucket persists the release.
+		bucket.Status.BucketID = ""
+		log.Info("Tracked bucket ID not found; releasing recorded claim and falling back to alias lookup", "bucketID", prevTrackedID, "alias", alias)
 	}
 
 	existing, err := getBucketWithTimeout(ctx, garageClient, garage.GetBucketRequest{GlobalAlias: alias})
@@ -652,6 +677,46 @@ func garageBucketReservationAlias(bucket *garagev1beta1.GarageBucket) (string, e
 		return "", fmt.Errorf("GarageBucket UID is required before reserving a remote bucket identity")
 	}
 	return garagev1beta1.UIDBoundReservationAlias("garage-rsv-", bucket.Namespace, bucket.Name, bucket.UID)
+}
+
+// ensureExclusiveBucketClaim fails the reconcile when another GarageBucket in
+// the same GarageCluster already claims a bucket identity this resource would
+// manage. Semantics:
+//   - A spec.bucketId adoption collides with any other claim (spec or status):
+//     a recorded identity always wins over a spec-only declaration.
+//   - A recorded status.bucketId only collides with another recorded claim,
+//     which means two resources both believe they own the bucket (out-of-band
+//     edits); both fail closed so a human resolves the duplicate rather than
+//     two controllers mutating one bucket.
+//
+// A spec-only claim on this resource's recorded identity is deliberately not a
+// conflict here: the claimant fails its own check, and this resource keeps
+// reconciling the bucket it already owns.
+func (r *GarageBucketReconciler) ensureExclusiveBucketClaim(ctx context.Context, bucket *garagev1beta1.GarageBucket) error {
+	if bucket.Spec.BucketID == "" && bucket.Status.BucketID == "" {
+		return nil
+	}
+	var existing garagev1beta1.GarageBucketList
+	if err := r.List(ctx, &existing); err != nil {
+		return fmt.Errorf("failed to check duplicate bucket claims: %w", err)
+	}
+	if bucket.Spec.BucketID != "" {
+		if other := garagev1beta1.FindBucketClaimConflict(bucket, bucket.Spec.BucketID, existing.Items); other != nil {
+			return fmt.Errorf(
+				"spec.bucketId %q is already managed by GarageBucket %s/%s; a Garage bucket can only be managed by one GarageBucket resource",
+				bucket.Spec.BucketID, other.Namespace, other.Name,
+			)
+		}
+	}
+	if bucket.Status.BucketID != "" {
+		if other := garagev1beta1.FindBucketStatusClaimConflict(bucket, bucket.Status.BucketID, existing.Items); other != nil {
+			return fmt.Errorf(
+				"status.bucketId %q is also recorded on GarageBucket %s/%s; resolve the duplicate ownership before reconciling",
+				bucket.Status.BucketID, other.Namespace, other.Name,
+			)
+		}
+	}
+	return nil
 }
 
 func (r *GarageBucketReconciler) clearBucketReservationAlias(
@@ -1391,6 +1456,22 @@ func (r *GarageBucketReconciler) finalize(ctx context.Context, bucket *garagev1b
 		return nil
 	}
 
+	// Never delete a bucket that another live GarageBucket still manages. This
+	// protects the rightful owner when a duplicate claimant (admitted before
+	// the informer cache caught up, or edited out-of-band) is deleted with
+	// deletionPolicy: Delete. Claimants that are themselves terminating are
+	// ignored so two simultaneous deletions cannot deadlock each other.
+	if r.Client != nil {
+		if other, err := r.terminatingBucketClaimant(ctx, bucket, bucketID); err != nil {
+			return err
+		} else if other != nil {
+			return fmt.Errorf(
+				"refusing to delete bucket %q because GarageBucket %s/%s still manages it; resolve the duplicate claim first",
+				bucketID, other.Namespace, other.Name,
+			)
+		}
+	}
+
 	log.Info("Deleting bucket", "bucketID", bucketID)
 
 	// Note: Garage requires bucket to be empty before deletion
@@ -1429,6 +1510,30 @@ func garageBucketFinalizationID(bucket *garagev1beta1.GarageBucket) (string, err
 		resolved = candidate
 	}
 	return resolved, nil
+}
+
+// terminatingBucketClaimant returns a live (non-terminating) GarageBucket that
+// claims bucketID within the same GarageCluster, or nil when the delete may
+// proceed. A list error is returned so finalization fails closed: the API is
+// reachable (the reconcile just read this object), so a failed claim scan
+// should retry rather than risk deleting a shared bucket.
+func (r *GarageBucketReconciler) terminatingBucketClaimant(ctx context.Context, bucket *garagev1beta1.GarageBucket, bucketID string) (*garagev1beta1.GarageBucket, error) {
+	var existing garagev1beta1.GarageBucketList
+	if err := r.List(ctx, &existing); err != nil {
+		return nil, fmt.Errorf("failed to check duplicate bucket claims before deletion: %w", err)
+	}
+	for i := range existing.Items {
+		other := &existing.Items[i]
+		if !other.DeletionTimestamp.IsZero() {
+			continue
+		}
+		if other.Spec.BucketID == bucketID || other.Status.BucketID == bucketID {
+			if garagev1beta1.BucketsShareGarageCluster(other, bucket) {
+				return other, nil
+			}
+		}
+	}
+	return nil, nil
 }
 
 func (r *GarageBucketReconciler) updateStatusWaiting(ctx context.Context, bucket *garagev1beta1.GarageBucket) (ctrl.Result, error) {

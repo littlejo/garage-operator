@@ -2869,7 +2869,7 @@ func effectiveWebAPI(cluster *garagev1beta2.GarageCluster) *garagev1beta2.WebAPI
 		eff.RootDomain = fmt.Sprintf(".%s.%s.svc", cluster.Name, cluster.Namespace)
 	}
 	if eff.Scheme == "" {
-		eff.Scheme = "http"
+		eff.Scheme = schemeHTTP
 	}
 	return eff
 }

@@ -51,6 +51,7 @@ const (
 	forceDeleteUnrevokedTokensAnnotation = "garage.rajsingh.info/force-delete-unrevoked-operator-tokens"
 	consistencyModeConsistent            = "consistent"
 	defaultRPCSecretKey                  = "rpc-secret"
+	defaultWebAPIScheme                  = "http"
 	healthStatusHealthy                  = "healthy"
 	garageNodeKind                       = "GarageNode"
 	stringTrue                           = "true"
@@ -116,7 +117,7 @@ func (d *GarageClusterDefaulter) Default(ctx context.Context, obj *GarageCluster
 		enabled := true
 		obj.Spec.WebAPI = &WebAPIConfig{
 			Enabled:    &enabled,
-			Scheme:     "http",
+			Scheme:     defaultWebAPIScheme,
 			RootDomain: fmt.Sprintf(".%s.%s.svc", obj.Name, obj.Namespace),
 		}
 	} else {
@@ -128,7 +129,7 @@ func (d *GarageClusterDefaulter) Default(ctx context.Context, obj *GarageCluster
 			obj.Spec.WebAPI.RootDomain = fmt.Sprintf(".%s.%s.svc", obj.Name, obj.Namespace)
 		}
 		if obj.Spec.WebAPI.Scheme == "" {
-			obj.Spec.WebAPI.Scheme = "http"
+			obj.Spec.WebAPI.Scheme = defaultWebAPIScheme
 		}
 	}
 

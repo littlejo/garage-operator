@@ -32,6 +32,10 @@ import (
 // the operator's generated-resource reconcilers.
 const garageOperatorFieldManager = "garage-operator"
 
+// jsonMetadataKey is the object metadata field name in server-side-apply
+// patch payloads.
+const jsonMetadataKey = "metadata"
+
 // The operator historically used controller-runtime's default user agent for
 // Update calls. The released image is /manager, so the apiserver records
 // "manager" as the Update manager. Keep the other names used by local and
@@ -232,9 +236,9 @@ func metadataApplyPatch(c client.Client, object client.Object, labels, annotatio
 		metadata["annotations"] = annotations
 	}
 	return json.Marshal(map[string]any{
-		"apiVersion": gvk.GroupVersion().String(),
-		"kind":       gvk.Kind,
-		"metadata":   metadata,
+		"apiVersion":    gvk.GroupVersion().String(),
+		"kind":          gvk.Kind,
+		jsonMetadataKey: metadata,
 	})
 }
 
@@ -264,9 +268,9 @@ func metadataApplyDeletePatch(c client.Client, object client.Object, labels, ann
 		metadata["annotations"] = values
 	}
 	return json.Marshal(map[string]any{
-		"apiVersion": gvk.GroupVersion().String(),
-		"kind":       gvk.Kind,
-		"metadata":   metadata,
+		"apiVersion":    gvk.GroupVersion().String(),
+		"kind":          gvk.Kind,
+		jsonMetadataKey: metadata,
 	})
 }
 

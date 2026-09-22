@@ -25,6 +25,32 @@ spec:
 
 If `globalAlias` is omitted, the resource name is used as the bucket's global alias. Use `bucketId` to manage an existing Garage bucket by immutable ID; when set, the operator never creates a replacement bucket.
 
+### Dropping `bucketId` after adoption
+
+`spec.bucketId` is only needed to establish the mapping. After the first
+reconciliation the operator records the resolved ID in `status.bucketId`, and
+you can remove the field from your manifest without any bucket churn — the
+operator keeps reconciling the same bucket from the recorded status:
+
+```bash
+kubectl get garagebucket app-data -n storage \
+  -o jsonpath='{.status.bucketId}{"\n"}'
+```
+
+Wait until that prints the expected ID, then delete `spec.bucketId` from the
+manifest. Three rules protect the mapping:
+
+- Removing `spec.bucketId` is only accepted once `status.bucketId` is recorded.
+- Setting `spec.bucketId` to a different bucket is always rejected — the
+  mapping itself is immutable.
+- A bucket ID can only be managed by one `GarageBucket` per GarageCluster;
+  admission and the controller both reject duplicate claims, and a duplicate
+  claimant's deletion can never remove a bucket another resource still manages.
+
+If `status.bucketId` is somehow lost while the alias still resolves to the
+adopted bucket, reconciliation fails with an actionable error instead of
+creating a duplicate bucket.
+
 ## Choose bucket deletion behavior
 
 `spec.deletionPolicy` controls what happens to the remote Garage bucket when

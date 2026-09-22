@@ -223,7 +223,20 @@ Implementation:
   Healthy handles requeue at 5m; unreachable at the fast unhealthy interval.
   `finalize` is a no-op for a handle (nothing owned).
 - **Adoption:** `GarageBucket.spec.bucketId` / `GarageKey.spec.importKey` bind to
-  pre-existing state. Creating a brand-new `GarageKey` without `importKey` needs
+  pre-existing state. For `GarageBucket`, adoption is recorded: once the
+  operator resolves a `spec.bucketId` (or creates a bucket), the ID persists in
+  `status.bucketId`, and the spec field may then be removed — the controller
+  keeps reconciling the recorded bucket (#430). The mapping stays immutable:
+  the webhook rejects re-pointing `spec.bucketId` at a different ID once
+  status is recorded, admission and `ensureExclusiveBucketClaim`
+  (garagebucket_controller.go) reject a bucket ID claimed by two
+  `GarageBucket`s of the same GarageCluster (spec-only claimant loses to a
+  recorded claim; two recorded claims fail closed on both sides), and
+  `finalize` refuses to delete a bucket another live `GarageBucket` still
+  manages. A genuine 404 on the tracked ID releases the status claim before
+  falling back to alias lookup; a wiped status with a live alias fails closed
+  via the "already owned by untracked Garage bucket" error rather than
+  duplicating. Creating a brand-new `GarageKey` without `importKey` needs
   deterministic key material, which derives from an RPC secret the handle does
   not auto-create — set `spec.network.rpcSecretRef` to the external cluster's RPC
   secret, or use `importKey`. The key controller surfaces this as an actionable

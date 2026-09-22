@@ -1681,6 +1681,124 @@ spec:
 			Expect(err).NotTo(HaveOccurred(), "Failed to delete drift test key: %s", output)
 		})
 
+		It("should keep reconciling an adopted bucket after spec.bucketId is removed", func() {
+			// #430: spec.bucketId only needs to establish the mapping. Once the
+			// operator records the resolved ID in status.bucketId, removing the
+			// field must cause no churn: the same bucket stays managed from
+			// status, nothing is created or deleted.
+			const adoptBucketName = "adopt-remove-bucket"
+			const duplicateBucketName = "duplicate-adopt-bucket"
+
+			By("creating a bucket without spec.bucketId and recording its identity")
+			bucketYAML := fmt.Sprintf(`
+apiVersion: garage.rajsingh.info/v1beta1
+kind: GarageBucket
+metadata:
+  name: %s
+  namespace: %s
+spec:
+  clusterRef:
+    name: %s
+`, adoptBucketName, testNamespace, storageClusterName)
+			cmd := exec.Command("kubectl", "apply", "-f", "-")
+			cmd.Stdin = strings.NewReader(bucketYAML)
+			_, err := utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred(), "Failed to create adoption test bucket")
+
+			recordedID := ""
+			Eventually(func(g Gomega) {
+				cmd := exec.Command("kubectl", "get", "garagebucket", adoptBucketName,
+					"-n", testNamespace, "-o", "jsonpath={.status.phase}/{.status.bucketId}")
+				output, err := utils.Run(cmd)
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(output).To(HavePrefix("Ready/"), "bucket phase/id: %s", output)
+				recordedID = strings.TrimPrefix(output, "Ready/")
+				g.Expect(recordedID).NotTo(BeEmpty())
+			}, 2*time.Minute, 5*time.Second).Should(Succeed())
+
+			triggerReconcile := func(name string) {
+				cmd := exec.Command("kubectl", "label", "--overwrite", "garagebucket", name,
+					"-n", testNamespace,
+					fmt.Sprintf("garage.rajsingh.info/reconcile-trigger=%d", time.Now().UnixNano()))
+				_, err := utils.Run(cmd)
+				Expect(err).NotTo(HaveOccurred())
+			}
+
+			By("re-affirming spec.bucketId with the recorded identity (must be accepted)")
+			cmd = exec.Command("kubectl", "patch", "garagebucket", adoptBucketName,
+				"-n", testNamespace, "--type=merge",
+				"-p", fmt.Sprintf(`{"spec":{"bucketId":%q}}`, recordedID))
+			_, err = utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred(), "setting spec.bucketId to the recorded identity should be admitted")
+			triggerReconcile(adoptBucketName)
+			Eventually(func(g Gomega) {
+				cmd := exec.Command("kubectl", "get", "garagebucket", adoptBucketName,
+					"-n", testNamespace, "-o", "jsonpath={.status.phase}/{.status.bucketId}")
+				output, err := utils.Run(cmd)
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(output).To(Equal("Ready/"+recordedID), "identity must not change: %s", output)
+			}, 2*time.Minute, 5*time.Second).Should(Succeed())
+
+			By("re-pointing spec.bucketId at a different bucket (must be rejected)")
+			cmd = exec.Command("kubectl", "patch", "garagebucket", adoptBucketName,
+				"-n", testNamespace, "--type=merge",
+				"-p", `{"spec":{"bucketId":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}`)
+			output, err := utils.Run(cmd)
+			Expect(err).To(HaveOccurred(), "re-pointing an adopted bucketId must be rejected: %s", output)
+			Expect(output).To(ContainSubstring("does not match the recorded bucket identity"))
+
+			By("removing spec.bucketId after adoption (must be accepted, no churn)")
+			cmd = exec.Command("kubectl", "patch", "garagebucket", adoptBucketName,
+				"-n", testNamespace, "--type=merge", "-p", `{"spec":{"bucketId":null}}`)
+			_, err = utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred(), "removing spec.bucketId after adoption should be admitted")
+
+			triggerReconcile(adoptBucketName)
+			Eventually(func(g Gomega) {
+				cmd := exec.Command("kubectl", "get", "garagebucket", adoptBucketName,
+					"-n", testNamespace, "-o", "jsonpath={.status.phase}/{.status.bucketId}")
+				output, err := utils.Run(cmd)
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(output).To(Equal("Ready/"+recordedID),
+					"the same bucket must keep being reconciled from status after spec.bucketId removal: %s", output)
+			}, 2*time.Minute, 5*time.Second).Should(Succeed())
+
+			By("rejecting a second GarageBucket claiming the same bucket ID")
+			duplicateYAML := fmt.Sprintf(`
+apiVersion: garage.rajsingh.info/v1beta1
+kind: GarageBucket
+metadata:
+  name: %s
+  namespace: %s
+spec:
+  clusterRef:
+    name: %s
+  bucketId: %s
+`, duplicateBucketName, testNamespace, storageClusterName, recordedID)
+			Eventually(func(g Gomega) {
+				cmd := exec.Command("kubectl", "apply", "-f", "-")
+				cmd.Stdin = strings.NewReader(duplicateYAML)
+				output, err := utils.Run(cmd)
+				g.Expect(err).To(HaveOccurred(),
+					"a bucket ID managed by another GarageBucket must be rejected at admission: %s", output)
+				g.Expect(output).To(ContainSubstring("already managed by GarageBucket"))
+			}, 2*time.Minute, 5*time.Second).Should(Succeed())
+
+			By("cleaning up adoption test resources")
+			// A duplicate admitted through a momentarily stale webhook cache can
+			// stay terminating behind the finalization guard while this bucket
+			// is still live, so do not wait on it; it converges once the owner
+			// below is gone (its finalizer then deletes the same remote bucket).
+			cmd = exec.Command("kubectl", "delete", "garagebucket", duplicateBucketName,
+				"-n", testNamespace, "--ignore-not-found", "--wait=false")
+			output, err = utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred(), "Failed to request duplicate claimant deletion: %s", output)
+			cmd = exec.Command("kubectl", "delete", "garagebucket", adoptBucketName,
+				"-n", testNamespace, "--ignore-not-found", "--timeout=2m")
+			output, err = utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred(), "Failed to delete adoption test bucket: %s", output)
+		})
+
 		It("should register gateway nodes in the cluster layout with capacity=nil", func() {
 			// Gateway pods participate in the cluster layout with capacity=nil
 			// (matching upstream `garage layout assign --gateway`). This is

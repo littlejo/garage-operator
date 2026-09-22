@@ -94,6 +94,9 @@ func (v *GarageBucketValidator) authorizationReader() client.Reader {
 // ValidateCreate implements admission.Validator so a webhook will be registered for the type.
 func (v *GarageBucketValidator) ValidateCreate(ctx context.Context, obj *GarageBucket) (admission.Warnings, error) {
 	garagebucketlog.Info("validate create", "name", obj.Name)
+	if err := v.validateBucketIDExclusivity(ctx, obj); err != nil {
+		return nil, err
+	}
 	return v.validateGarageBucket(ctx, obj)
 }
 
@@ -103,8 +106,19 @@ func (v *GarageBucketValidator) ValidateUpdate(ctx context.Context, oldObj, newO
 	if clusterReferenceChanged(oldObj.Spec.ClusterRef, newObj.Spec.ClusterRef, newObj.Namespace) {
 		return nil, fmt.Errorf("clusterRef is immutable after creation; create a new GarageBucket to manage a bucket in another GarageCluster")
 	}
-	if oldObj.Status.BucketID != "" && oldObj.Spec.BucketID != newObj.Spec.BucketID {
-		return nil, fmt.Errorf("bucketId is immutable after the Garage bucket identity has been established")
+	// The operator records the resolved bucket identity in status.bucketId. Once
+	// recorded, spec.bucketId may be removed (the operator keeps reconciling the
+	// recorded bucket from status) or set to the recorded value, but never
+	// re-pointed at a different bucket — the mapping itself stays immutable.
+	if oldObj.Status.BucketID != "" && newObj.Spec.BucketID != "" &&
+		newObj.Spec.BucketID != oldObj.Status.BucketID {
+		return nil, fmt.Errorf(
+			"spec.bucketId %q does not match the recorded bucket identity %q: after adoption bucketId can only be removed or set to the recorded value, never changed to another bucket",
+			newObj.Spec.BucketID, oldObj.Status.BucketID,
+		)
+	}
+	if err := v.validateBucketIDExclusivity(ctx, newObj); err != nil {
+		return nil, err
 	}
 	oldDefaulted := oldObj.DeepCopy()
 	_ = (&GarageBucketDefaulter{}).Default(ctx, oldDefaulted)
@@ -153,6 +167,30 @@ func (v *GarageBucketValidator) validateGarageBucketWithOptions(ctx context.Cont
 // ReferenceGrant reads. Controllers call it before any remote mutation.
 func ValidateGarageBucketSpec(obj *GarageBucket) error {
 	return validateGarageBucketSpecWithOptions(obj, false)
+}
+
+// validateBucketIDExclusivity rejects a spec.bucketId that another GarageBucket
+// already claims in the same GarageCluster, either by explicit adoption or by a
+// recorded status identity. A Garage bucket can only be managed by one
+// resource; enforcing that at admission keeps a duplicate claimant from ever
+// gaining the deletion finalizer that could remove the rightful owner's bucket.
+// The check is best-effort against the informer cache: the bucket controller
+// re-checks with the same semantics before every remote mutation.
+func (v *GarageBucketValidator) validateBucketIDExclusivity(ctx context.Context, obj *GarageBucket) error {
+	if obj.Spec.BucketID == "" || v.Client == nil {
+		return nil
+	}
+	var existing GarageBucketList
+	if err := v.Client.List(ctx, &existing); err != nil {
+		return fmt.Errorf("failed to check duplicate spec.bucketId claims: %w", err)
+	}
+	if other := FindBucketClaimConflict(obj, obj.Spec.BucketID, existing.Items); other != nil {
+		return fmt.Errorf(
+			"spec.bucketId %q is already managed by GarageBucket %s/%s; a Garage bucket can only be managed by one GarageBucket resource",
+			obj.Spec.BucketID, other.Namespace, other.Name,
+		)
+	}
+	return nil
 }
 
 func validateGarageBucketSpecWithOptions(obj *GarageBucket, allowUnchangedLegacy bool) error {

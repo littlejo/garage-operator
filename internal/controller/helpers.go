@@ -210,6 +210,12 @@ const (
 	publicEndpointTypeNodePort     = "NodePort"
 )
 
+// S3 endpoint URL schemes accepted by ResolveS3Endpoint.
+const (
+	schemeHTTP  = "http"
+	schemeHTTPS = "https"
+)
+
 const (
 	envGarageRPCSecret        = "GARAGE_RPC_SECRET"
 	envGarageRPCSecretFile    = "GARAGE_RPC_SECRET_FILE"
@@ -492,7 +498,6 @@ func ResolveS3Endpoint(cluster *garagev1beta2.GarageCluster, clusterDomain strin
 		}
 		raw = svcFQDN(cluster.Name, cluster.Namespace, getS3Port(cluster), clusterDomain)
 	}
-	const schemeHTTP, schemeHTTPS = "http", "https"
 	if !strings.Contains(raw, "://") {
 		raw = schemeHTTP + "://" + raw
 	}

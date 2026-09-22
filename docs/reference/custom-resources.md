@@ -256,12 +256,17 @@ the Kubernetes resource deletes the remote bucket: `Delete` is the default and
 preserves the existing behavior; `Retain` removes Kubernetes management while
 leaving the Garage bucket, objects, aliases, permissions, and configuration
 untouched. `bucketId` pins an existing Garage bucket and
-prevents replacement. `globalAlias` defaults from the object name when omitted;
-`localAliases` create key-scoped aliases. `quotas` supports `maxSize` and
-`maxObjects`. `website` manages `indexDocument` and `errorDocument`; routing
-rules and redirect-all behavior must be configured through S3 APIs. `lifecycle`
-supports Garage's subset of S3 expiration and incomplete-multipart rules and is
-evaluated asynchronously by Garage's lifecycle worker. `keyPermissions` and
+prevents replacement; after the first reconciliation the operator records the
+resolved ID in `status.bucketId`, and the field can then be removed from the
+manifest — the operator keeps reconciling the recorded bucket. Re-pointing
+`bucketId` at a different bucket remains rejected; a bucket ID can also be
+claimed by only one `GarageBucket` per GarageCluster. `globalAlias` defaults
+from the object name when omitted; `localAliases` create key-scoped aliases.
+`quotas` supports `maxSize` and `maxObjects`. `website` manages
+`indexDocument` and `errorDocument`; routing rules and redirect-all behavior
+must be configured through S3 APIs. `lifecycle` supports Garage's subset of
+S3 expiration and incomplete-multipart rules and is evaluated asynchronously
+by Garage's lifecycle worker. `keyPermissions` and
 `GarageKey.spec.bucketPermissions` are equivalent declaration directions and
 are merged when both describe the same grant.
 
@@ -270,7 +275,8 @@ approved by a `GarageReferenceGrant` in the cluster's namespace.
 
 When using `Retain`, save `status.bucketId` before deleting the resource. A
 future `GarageBucket` can re-adopt the retained bucket by setting `spec.bucketId`
-to that ID. `Retain` only protects the remote bucket; deleting its underlying
+to that ID (and drop the field again once it shows up in the new resource's
+status). `Retain` only protects the remote bucket; deleting its underlying
 Garage cluster or storage can still make the data unavailable.
 
 ### Status

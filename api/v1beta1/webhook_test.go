@@ -4980,3 +4980,292 @@ func TestGarageNodeValidator_ZoneFrom(t *testing.T) {
 		}
 	})
 }
+
+// ── GarageBucketValidator: spec.bucketId adoption (#430) ─────────────────────
+
+const (
+	testAdoptedBucketID  = "aa11bb22cc33dd44ee55ff6677889900"
+	testForeignBucketID  = "different0000000000000000000000id"
+	testOtherClusterName = "other-cluster"
+)
+
+func TestGarageBucketValidator_BucketIDUpdateAfterRecordedIdentity(t *testing.T) {
+	v := &GarageBucketValidator{Client: fake.NewClientBuilder().WithScheme(fakeScheme(t)).Build()}
+	base := func(specID, statusID string) *GarageBucket {
+		b := &GarageBucket{
+			ObjectMeta: metav1.ObjectMeta{Name: testBucket, Namespace: testSourceNS},
+			Spec:       GarageBucketSpec{ClusterRef: ClusterReference{Name: testCluster}},
+			Status:     GarageBucketStatus{BucketID: statusID},
+		}
+		if specID != "" {
+			b.Spec.BucketID = specID
+		}
+		return b
+	}
+	tests := []struct {
+		name    string
+		oldSpec string
+		newSpec string
+		status  string
+		wantErr string
+	}{
+		{"removal allowed once recorded", testAdoptedBucketID, "", testAdoptedBucketID, ""},
+		{"re-pointing rejected once recorded", testAdoptedBucketID, testForeignBucketID, testAdoptedBucketID, "does not match the recorded bucket identity"},
+		{"re-adding recorded identity allowed", "", testAdoptedBucketID, testAdoptedBucketID, ""},
+		{"different id rejected once recorded", "", testForeignBucketID, testAdoptedBucketID, "does not match the recorded bucket identity"},
+		{"spec change still allowed before recording", testAdoptedBucketID, testForeignBucketID, "", ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			oldObj := base(tt.oldSpec, tt.status)
+			newObj := base(tt.newSpec, tt.status)
+			_, err := v.ValidateUpdate(context.Background(), oldObj, newObj)
+			if tt.wantErr == "" {
+				if err != nil {
+					t.Fatalf("expected update to be allowed, got: %v", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("expected error containing %q, got: %v", tt.wantErr, err)
+			}
+		})
+	}
+}
+
+func TestGarageBucketValidator_BucketIDExclusivityCreate(t *testing.T) {
+	other := func(name, cluster string, specID, statusID string) *GarageBucket {
+		b := &GarageBucket{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: testSourceNS},
+			Spec:       GarageBucketSpec{ClusterRef: ClusterReference{Name: cluster}},
+		}
+		if specID != "" {
+			b.Spec.BucketID = specID
+		}
+		if statusID != "" {
+			b.Status.BucketID = statusID
+		}
+		return b
+	}
+	tests := []struct {
+		name     string
+		existing []*GarageBucket
+		wantErr  string
+	}{
+		{"status-only claim rejected", []*GarageBucket{other("other-bucket", testCluster, "", testAdoptedBucketID)}, "already managed by GarageBucket"},
+		{"spec claim rejected", []*GarageBucket{other("other-bucket", testCluster, testAdoptedBucketID, "")}, "already managed by GarageBucket"},
+		{"claim on a different cluster allowed", []*GarageBucket{other("other-bucket", testOtherClusterName, testAdoptedBucketID, "")}, ""},
+		{"unique id allowed", nil, ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			builder := fake.NewClientBuilder().WithScheme(fakeScheme(t))
+			for _, b := range tt.existing {
+				builder = builder.WithObjects(b)
+			}
+			v := &GarageBucketValidator{Client: builder.Build()}
+			_, err := v.ValidateCreate(context.Background(), other("app-data", testCluster, testAdoptedBucketID, ""))
+			if tt.wantErr == "" {
+				if err != nil {
+					t.Fatalf("expected create to be allowed, got: %v", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("expected error containing %q, got: %v", tt.wantErr, err)
+			}
+		})
+	}
+}
+
+func TestGarageBucketValidator_BucketIDExclusivityOnUpdate(t *testing.T) {
+	self := func(specID, statusID string) *GarageBucket {
+		b := &GarageBucket{
+			ObjectMeta: metav1.ObjectMeta{Name: testBucket, Namespace: testSourceNS},
+			Spec:       GarageBucketSpec{ClusterRef: ClusterReference{Name: testCluster}},
+			Status:     GarageBucketStatus{BucketID: statusID},
+		}
+		if specID != "" {
+			b.Spec.BucketID = specID
+		}
+		return b
+	}
+	t.Run("listing includes the object itself without a false conflict", func(t *testing.T) {
+		existing := self(testAdoptedBucketID, testAdoptedBucketID)
+		v := &GarageBucketValidator{Client: fake.NewClientBuilder().WithScheme(fakeScheme(t)).WithObjects(existing).Build()}
+		oldObj := existing.DeepCopy()
+		newObj := existing.DeepCopy()
+		if _, err := v.ValidateUpdate(context.Background(), oldObj, newObj); err != nil {
+			t.Fatalf("update must not conflict with its own recorded claim: %v", err)
+		}
+	})
+	t.Run("another bucket's claim is still rejected on update", func(t *testing.T) {
+		claimant := &GarageBucket{
+			ObjectMeta: metav1.ObjectMeta{Name: "other-bucket", Namespace: testSourceNS},
+			Spec:       GarageBucketSpec{ClusterRef: ClusterReference{Name: testCluster}},
+			Status:     GarageBucketStatus{BucketID: testAdoptedBucketID},
+		}
+		v := &GarageBucketValidator{Client: fake.NewClientBuilder().WithScheme(fakeScheme(t)).WithObjects(claimant).Build()}
+		_, err := v.ValidateUpdate(context.Background(), self("", ""), self(testAdoptedBucketID, ""))
+		if err == nil || !strings.Contains(err.Error(), "already managed by GarageBucket") {
+			t.Fatalf("expected a duplicate-claim rejection on update, got: %v", err)
+		}
+	})
+}
+
+func TestGarageBucketValidator_NilClientSkipsBucketIDExclusivity(t *testing.T) {
+	v := &GarageBucketValidator{}
+	bucket := &GarageBucket{
+		ObjectMeta: metav1.ObjectMeta{Name: testBucket, Namespace: testSourceNS},
+		Spec:       GarageBucketSpec{ClusterRef: ClusterReference{Name: testCluster}, BucketID: testAdoptedBucketID},
+	}
+	if _, err := v.ValidateCreate(context.Background(), bucket); err != nil {
+		t.Fatalf("nil-client validator must skip exclusivity and accept a valid bucket: %v", err)
+	}
+	if _, err := v.ValidateUpdate(context.Background(), bucket.DeepCopy(), bucket.DeepCopy()); err != nil {
+		t.Fatalf("nil-client validator must skip exclusivity on update: %v", err)
+	}
+	invalid := bucket.DeepCopy()
+	invalid.Name = "Bad-Alias"
+	if _, err := v.ValidateCreate(context.Background(), invalid); err == nil {
+		t.Fatal("nil-client validator must still run the remaining validations")
+	}
+}
+
+func TestBucketsShareGarageCluster(t *testing.T) {
+	inNS := func(name, namespace string, ref ClusterReference) *GarageBucket {
+		return &GarageBucket{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace},
+			Spec:       GarageBucketSpec{ClusterRef: ref},
+		}
+	}
+	local := inNS("app-data", testSourceNS, ClusterReference{Name: testCluster})
+	t.Run("nil safety", func(t *testing.T) {
+		if BucketsShareGarageCluster(nil, local) || BucketsShareGarageCluster(local, nil) || BucketsShareGarageCluster(nil, nil) {
+			t.Fatal("nil operands must never share a cluster")
+		}
+	})
+	t.Run("implicit same namespace references share the cluster", func(t *testing.T) {
+		if !BucketsShareGarageCluster(local, inNS("other-bucket", testSourceNS, ClusterReference{Name: testCluster})) {
+			t.Fatal("same-namespace refs to the same cluster must share")
+		}
+	})
+	t.Run("explicit namespace resolves to the object namespace", func(t *testing.T) {
+		if !BucketsShareGarageCluster(local, inNS("other-bucket", testSourceNS, ClusterReference{Name: testCluster, Namespace: testSourceNS})) {
+			t.Fatal("explicit clusterRef namespace equal to the object namespace must share")
+		}
+	})
+	t.Run("different cluster names do not share", func(t *testing.T) {
+		if BucketsShareGarageCluster(local, inNS("other-bucket", testSourceNS, ClusterReference{Name: testOtherClusterName})) {
+			t.Fatal("different cluster names must not share")
+		}
+	})
+	t.Run("different effective namespaces do not share", func(t *testing.T) {
+		if BucketsShareGarageCluster(local, inNS("other-bucket", testSourceNS, ClusterReference{Name: testCluster, Namespace: testTargetNS})) {
+			t.Fatal("refs resolving to different namespaces must not share")
+		}
+	})
+}
+
+func TestFindBucketClaimConflict(t *testing.T) {
+	self := &GarageBucket{
+		ObjectMeta: metav1.ObjectMeta{Name: "app-data", Namespace: testSourceNS},
+		Spec:       GarageBucketSpec{ClusterRef: ClusterReference{Name: testCluster}},
+	}
+	other := func(name, namespace string, ref ClusterReference, specID, statusID string) GarageBucket {
+		b := GarageBucket{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace},
+			Spec:       GarageBucketSpec{ClusterRef: ref},
+			Status:     GarageBucketStatus{BucketID: statusID},
+		}
+		if specID != "" {
+			b.Spec.BucketID = specID
+		}
+		return b
+	}
+	local := ClusterReference{Name: testCluster}
+	tests := []struct {
+		name     string
+		self     *GarageBucket
+		bucketID string
+		items    []GarageBucket
+		want     string
+	}{
+		{"nil self", nil, testAdoptedBucketID, nil, ""},
+		{"empty bucketID", self, "", []GarageBucket{other("other-bucket", testSourceNS, local, testAdoptedBucketID, "")}, ""},
+		{"self excluded by name and namespace", self, testAdoptedBucketID,
+			[]GarageBucket{other("app-data", testSourceNS, local, testAdoptedBucketID, testAdoptedBucketID)}, ""},
+		{"spec claim found", self, testAdoptedBucketID,
+			[]GarageBucket{other("other-bucket", testSourceNS, local, testAdoptedBucketID, "")}, "other-bucket"},
+		{"status-only claim found", self, testAdoptedBucketID,
+			[]GarageBucket{other("other-bucket", testSourceNS, local, "", testAdoptedBucketID)}, "other-bucket"},
+		{"different cluster ignored", self, testAdoptedBucketID,
+			[]GarageBucket{other("other-bucket", testSourceNS, ClusterReference{Name: testOtherClusterName}, testAdoptedBucketID, "")}, ""},
+		{"same name in another namespace is a distinct resource", self, testAdoptedBucketID,
+			[]GarageBucket{other("app-data", testTargetNS, ClusterReference{Name: testCluster, Namespace: testSourceNS}, testAdoptedBucketID, "")}, "app-data"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := FindBucketClaimConflict(tt.self, tt.bucketID, tt.items)
+			if tt.want == "" {
+				if got != nil {
+					t.Fatalf("expected no conflict, got %s/%s", got.Namespace, got.Name)
+				}
+				return
+			}
+			if got == nil || got.Name != tt.want {
+				t.Fatalf("expected conflict with %q, got %v", tt.want, got)
+			}
+		})
+	}
+}
+
+func TestFindBucketStatusClaimConflict(t *testing.T) {
+	self := &GarageBucket{
+		ObjectMeta: metav1.ObjectMeta{Name: "app-data", Namespace: testSourceNS},
+		Spec:       GarageBucketSpec{ClusterRef: ClusterReference{Name: testCluster}},
+	}
+	other := func(name string, specID, statusID string) GarageBucket {
+		b := GarageBucket{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: testSourceNS},
+			Spec:       GarageBucketSpec{ClusterRef: ClusterReference{Name: testCluster}},
+			Status:     GarageBucketStatus{BucketID: statusID},
+		}
+		if specID != "" {
+			b.Spec.BucketID = specID
+		}
+		return b
+	}
+	tests := []struct {
+		name     string
+		self     *GarageBucket
+		bucketID string
+		items    []GarageBucket
+		want     string
+	}{
+		{"nil self", nil, testAdoptedBucketID, nil, ""},
+		{"empty bucketID", self, "", []GarageBucket{other("other-bucket", "", testAdoptedBucketID)}, ""},
+		{"self excluded", self, testAdoptedBucketID, []GarageBucket{other("app-data", "", testAdoptedBucketID)}, ""},
+		{"status claim found", self, testAdoptedBucketID, []GarageBucket{other("other-bucket", "", testAdoptedBucketID)}, "other-bucket"},
+		{"spec-only claim ignored", self, testAdoptedBucketID, []GarageBucket{other("other-bucket", testAdoptedBucketID, "")}, ""},
+		{"different cluster ignored", func() *GarageBucket {
+			b := self.DeepCopy()
+			b.Spec.ClusterRef.Name = testOtherClusterName
+			return b
+		}(), testAdoptedBucketID, []GarageBucket{other("other-bucket", "", testAdoptedBucketID)}, ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := FindBucketStatusClaimConflict(tt.self, tt.bucketID, tt.items)
+			if tt.want == "" {
+				if got != nil {
+					t.Fatalf("expected no conflict, got %s/%s", got.Namespace, got.Name)
+				}
+				return
+			}
+			if got == nil || got.Name != tt.want {
+				t.Fatalf("expected conflict with %q, got %v", tt.want, got)
+			}
+		})
+	}
+}

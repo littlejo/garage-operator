@@ -59,3 +59,63 @@ func clusterReferenceChanged(oldRef, newRef ClusterReference, objectNamespace st
 	newName, newNamespace := effectiveClusterReference(newRef, objectNamespace)
 	return oldName != newName || oldNamespace != newNamespace
 }
+
+// BucketsShareGarageCluster reports whether two GarageBucket resources resolve
+// to the same GarageCluster reference, so bucket IDs recorded on them compete
+// for the same Garage instance.
+func BucketsShareGarageCluster(a, b *GarageBucket) bool {
+	if a == nil || b == nil {
+		return false
+	}
+	aName, aNamespace := effectiveClusterReference(a.Spec.ClusterRef, a.Namespace)
+	bName, bNamespace := effectiveClusterReference(b.Spec.ClusterRef, b.Namespace)
+	return aName == bName && aNamespace == bNamespace
+}
+
+// FindBucketClaimConflict returns the first GarageBucket in items, other than
+// self, that claims bucketID through spec.bucketId or status.bucketId and
+// resolves to the same GarageCluster. Returns nil when the ID is unclaimed.
+// A resource is matched on name and namespace because UIDs are not stable
+// across fake clients in unit tests.
+func FindBucketClaimConflict(self *GarageBucket, bucketID string, items []GarageBucket) *GarageBucket {
+	if self == nil || bucketID == "" {
+		return nil
+	}
+	for i := range items {
+		other := &items[i]
+		if other.Name == self.Name && other.Namespace == self.Namespace {
+			continue
+		}
+		if !BucketsShareGarageCluster(other, self) {
+			continue
+		}
+		if other.Spec.BucketID == bucketID || other.Status.BucketID == bucketID {
+			return other
+		}
+	}
+	return nil
+}
+
+// FindBucketStatusClaimConflict returns the first GarageBucket in items, other
+// than self, whose recorded status.bucketId equals bucketID within the same
+// GarageCluster. Two recorded claims on one bucket ID can only come from
+// out-of-band edits, so callers must fail closed instead of picking a winner.
+func FindBucketStatusClaimConflict(self *GarageBucket, bucketID string, items []GarageBucket) *GarageBucket {
+	if self == nil || bucketID == "" {
+		return nil
+	}
+	for i := range items {
+		other := &items[i]
+		if other.Name == self.Name && other.Namespace == self.Namespace {
+			continue
+		}
+		if other.Status.BucketID != bucketID {
+			continue
+		}
+		if !BucketsShareGarageCluster(other, self) {
+			continue
+		}
+		return other
+	}
+	return nil
+}

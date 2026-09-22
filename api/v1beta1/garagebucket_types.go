@@ -462,6 +462,7 @@ type WebsiteConfigStatus struct {
 // +kubebuilder:resource:shortName=gb
 // +kubebuilder:printcolumn:name="Cluster",type="string",JSONPath=".spec.clusterRef.name"
 // +kubebuilder:printcolumn:name="Alias",type="string",JSONPath=".status.globalAlias"
+// +kubebuilder:printcolumn:name="Bucket ID",type="string",JSONPath=".status.bucketId"
 // +kubebuilder:printcolumn:name="Size",type="string",JSONPath=".status.size"
 // +kubebuilder:printcolumn:name="Objects",type="integer",JSONPath=".status.quotaUsage.objectCount"
 // +kubebuilder:printcolumn:name="Website",type="boolean",JSONPath=".status.websiteEnabled"

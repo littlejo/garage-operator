@@ -411,6 +411,9 @@ spec:
     - jsonPath: .status.globalAlias
       name: Alias
       type: string
+    - jsonPath: .status.bucketId
+      name: Bucket ID
+      type: string
     - jsonPath: .status.size
       name: Size
       type: string
