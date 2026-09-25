@@ -18,6 +18,7 @@ package controller
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -33,6 +34,9 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 
 	garagev1beta1 "github.com/rajsinghtech/garage-operator/api/v1beta1"
@@ -58,15 +62,14 @@ func websiteExposureTestScheme(t *testing.T) *runtime.Scheme {
 	return scheme
 }
 
-// websiteExposureTestClient builds a fake client whose REST mapper reports
-// HTTPRoute as available (or not, when gatewayAPI is false). It returns the
-// client and the scheme it was built with (the fake client does not expose
-// its scheme through the client.Client interface).
-func websiteExposureTestClient(t *testing.T, gatewayAPI bool, objects ...client.Object) (client.Client, *runtime.Scheme) {
+// websiteExposureTestRESTMapper builds the REST mapper a fake client needs so
+// that namespace checks (client.IsObjectNamespaced) and the Gateway API
+// CRD probe behave like the operator's real mapper: Ingress is always a
+// built-in, HTTPRoute is known only when gatewayAPI is true. The default
+// group versions must list the probed groups or version-less RESTMapping
+// lookups fail.
+func websiteExposureTestRESTMapper(t *testing.T, gatewayAPI bool) meta.RESTMapper {
 	t.Helper()
-	scheme := websiteExposureTestScheme(t)
-	// DefaultRESTMapper resolves a version-less RESTMapping against its
-	// default group versions, so the groups being probed must be listed.
 	defaultGroupVersions := []schema.GroupVersion{networkingv1.SchemeGroupVersion}
 	if gatewayAPI {
 		defaultGroupVersions = append(defaultGroupVersions, gatewayv1.SchemeGroupVersion)
@@ -76,9 +79,19 @@ func websiteExposureTestClient(t *testing.T, gatewayAPI bool, objects ...client.
 	if gatewayAPI {
 		mapper.Add(gatewayv1.SchemeGroupVersion.WithKind("HTTPRoute"), meta.RESTScopeNamespace)
 	}
+	return mapper
+}
+
+// websiteExposureTestClient builds a fake client whose REST mapper reports
+// HTTPRoute as available (or not, when gatewayAPI is false). It returns the
+// client and the scheme it was built with (the fake client does not expose
+// its scheme through the client.Client interface).
+func websiteExposureTestClient(t *testing.T, gatewayAPI bool, objects ...client.Object) (client.Client, *runtime.Scheme) {
+	t.Helper()
+	scheme := websiteExposureTestScheme(t)
 	c := fake.NewClientBuilder().
 		WithScheme(scheme).
-		WithRESTMapper(mapper).
+		WithRESTMapper(websiteExposureTestRESTMapper(t, gatewayAPI)).
 		WithStatusSubresource(&garagev1beta1.GarageBucket{}).
 		WithObjects(objects...).
 		Build()
@@ -326,7 +339,7 @@ func TestWebsiteExposureForeignObjectRefused(t *testing.T) {
 	if cond.Status != metav1.ConditionFalse || cond.Reason != garagev1beta1.ReasonReconcileFailed {
 		t.Fatalf("condition = %+v, want False/ReconcileFailed", cond)
 	}
-	if !strings.Contains(cond.Message, "not controlled by") {
+	if !strings.Contains(cond.Message, "not owned by") {
 		t.Fatalf("condition message = %q, want ownership refusal", cond.Message)
 	}
 	// The foreign object must be untouched: no owner reference added.
@@ -444,7 +457,244 @@ func TestWebsiteExposureCrossNamespace(t *testing.T) {
 	if metav1.IsControlledBy(ingress, bucket) {
 		t.Fatalf("cross-namespace resource must not carry a bucket owner reference: %+v", ingress.OwnerReferences)
 	}
+	if ingress.Labels[labelWebsiteExposureOwner] != string(bucket.UID) {
+		t.Fatalf("cross-namespace resource must carry the durable UID ownership label, labels = %v", ingress.Labels)
+	}
 	if ingress.Spec.Rules[0].Host != "site.example.com" {
 		t.Fatalf("host = %q", ingress.Spec.Rules[0].Host)
+	}
+}
+
+// TestWebsiteExposureCrossNamespaceUpdateAfterCreate is the regression test
+// for the review finding: a cross-namespace exposure has no owner reference,
+// so the second reconcile (any spec/host update) must still recognize the
+// operator-created object via the durable UID label and update it, not treat
+// it as foreign.
+func TestWebsiteExposureCrossNamespaceUpdateAfterCreate(t *testing.T) {
+	ctx := context.Background()
+	bucket := websiteExposureTestBucket("apps")
+	cluster := websiteExposureTestCluster()
+	bucket.Spec.WebsiteExposure = &garagev1beta1.WebsiteExposureConfig{
+		Ingress: &garagev1beta1.WebsiteExposureIngressConfig{IngressClassName: "traefik"},
+	}
+	c, scheme := websiteExposureTestClient(t, false, bucket, cluster)
+	r := &GarageBucketReconciler{Client: c, Scheme: scheme}
+
+	if _, err := r.reconcileWebsiteExposure(ctx, bucket, cluster); err != nil {
+		t.Fatalf("first reconcile: %v", err)
+	}
+	ingress := &networkingv1.Ingress{}
+	if err := c.Get(ctx, types.NamespacedName{Name: "site-website", Namespace: cluster.Namespace}, ingress); err != nil {
+		t.Fatalf("expected Ingress after first reconcile: %v", err)
+	}
+	if ingress.Spec.IngressClassName == nil || *ingress.Spec.IngressClassName != "traefik" {
+		t.Fatalf("ingressClassName = %v, want traefik", ingress.Spec.IngressClassName)
+	}
+
+	// The cross-namespace object carries no owner reference, so this update
+	// can only work through the durable UID ownership marker.
+	bucket.Spec.WebsiteExposure.Ingress.IngressClassName = "nginx"
+	bucket.Spec.WebsiteExposure.TLSSecretName = "site-tls"
+	if _, err := r.reconcileWebsiteExposure(ctx, bucket, cluster); err != nil {
+		t.Fatalf("second reconcile: %v", err)
+	}
+	if err := c.Get(ctx, types.NamespacedName{Name: "site-website", Namespace: cluster.Namespace}, ingress); err != nil {
+		t.Fatalf("expected Ingress after second reconcile: %v", err)
+	}
+	if ingress.Spec.IngressClassName == nil || *ingress.Spec.IngressClassName != "nginx" {
+		t.Fatalf("ingressClassName after update = %v, want nginx", ingress.Spec.IngressClassName)
+	}
+	if len(ingress.Spec.TLS) != 1 || ingress.Spec.TLS[0].SecretName != "site-tls" {
+		t.Fatalf("tls = %+v, want the updated TLS secret", ingress.Spec.TLS)
+	}
+	cond := websiteExposureCondition(t, bucket)
+	if cond.Status != metav1.ConditionTrue || cond.Reason != "Exposed" {
+		t.Fatalf("condition after update = %+v, want True/Exposed", cond)
+	}
+}
+
+// TestWebsiteExposureCrossNamespaceHTTPRouteUpdate proves the ownership fix
+// is not Ingress-specific: a cross-namespace HTTPRoute must also be
+// updatable after the first create.
+func TestWebsiteExposureCrossNamespaceHTTPRouteUpdate(t *testing.T) {
+	ctx := context.Background()
+	bucket := websiteExposureTestBucket("apps")
+	cluster := websiteExposureTestCluster()
+	bucket.Spec.WebsiteExposure = &garagev1beta1.WebsiteExposureConfig{
+		Host: "site.example.com",
+		Gateway: &garagev1beta1.WebsiteExposureGatewayConfig{
+			ParentRefs: []garagev1beta1.ParentReferenceConfig{{Name: "gw-1"}},
+		},
+	}
+	c, scheme := websiteExposureTestClient(t, true, bucket, cluster)
+	r := &GarageBucketReconciler{Client: c, Scheme: scheme}
+
+	if _, err := r.reconcileWebsiteExposure(ctx, bucket, cluster); err != nil {
+		t.Fatalf("first reconcile: %v", err)
+	}
+	route := &gatewayv1.HTTPRoute{}
+	if err := c.Get(ctx, types.NamespacedName{Name: "site-website", Namespace: cluster.Namespace}, route); err != nil {
+		t.Fatalf("expected HTTPRoute after first reconcile: %v", err)
+	}
+	if route.Labels[labelWebsiteExposureOwner] != string(bucket.UID) {
+		t.Fatalf("cross-namespace route must carry the durable UID label, labels = %v", route.Labels)
+	}
+
+	bucket.Spec.WebsiteExposure.Gateway.ParentRefs = []garagev1beta1.ParentReferenceConfig{{Name: "gw-2", SectionName: "https"}}
+	if _, err := r.reconcileWebsiteExposure(ctx, bucket, cluster); err != nil {
+		t.Fatalf("second reconcile: %v", err)
+	}
+	if err := c.Get(ctx, types.NamespacedName{Name: "site-website", Namespace: cluster.Namespace}, route); err != nil {
+		t.Fatalf("expected HTTPRoute after second reconcile: %v", err)
+	}
+	if len(route.Spec.ParentRefs) != 1 || route.Spec.ParentRefs[0].Name != "gw-2" {
+		t.Fatalf("parentRefs after update = %+v, want gw-2", route.Spec.ParentRefs)
+	}
+}
+
+// TestWebsiteExposureCrossNamespaceDeletion covers the deletion half of the
+// ownership fix: removing the exposure spec (or deleting the bucket) must
+// remove the cross-namespace resource, which has no owner reference to
+// garbage-collect it.
+func TestWebsiteExposureCrossNamespaceDeletion(t *testing.T) {
+	ctx := context.Background()
+	bucket := websiteExposureTestBucket("apps")
+	cluster := websiteExposureTestCluster()
+	bucket.Spec.WebsiteExposure = &garagev1beta1.WebsiteExposureConfig{
+		Ingress: &garagev1beta1.WebsiteExposureIngressConfig{},
+	}
+	c, scheme := websiteExposureTestClient(t, false, bucket, cluster)
+	r := &GarageBucketReconciler{Client: c, Scheme: scheme}
+
+	if _, err := r.reconcileWebsiteExposure(ctx, bucket, cluster); err != nil {
+		t.Fatalf("reconcileWebsiteExposure: %v", err)
+	}
+
+	bucket.Spec.WebsiteExposure = nil
+	if _, err := r.reconcileWebsiteExposure(ctx, bucket, cluster); err != nil {
+		t.Fatalf("reconcile after spec removal: %v", err)
+	}
+	ingress := &networkingv1.Ingress{}
+	if err := c.Get(ctx, types.NamespacedName{Name: "site-website", Namespace: cluster.Namespace}, ingress); !k8errors.IsNotFound(err) {
+		t.Fatalf("cross-namespace Ingress must be deleted on spec removal: get err = %v", err)
+	}
+}
+
+// TestWebsiteExposureCleanupSurvivesMissingCluster is the regression test for
+// the second review finding: the deletion-path cleanup must identify the
+// generated object from spec.clusterRef alone, without the cluster object
+// existing, and return errors so the caller can retain the finalizer.
+func TestWebsiteExposureCleanupSurvivesMissingCluster(t *testing.T) {
+	ctx := context.Background()
+	bucket := websiteExposureTestBucket("apps")
+	bucket.Spec.ClusterRef = garagev1beta1.ClusterReference{Name: "garage", Namespace: "garage-ns"}
+	// The bucket had a cross-namespace exposure, so it must be cleaned up.
+	bucket.Spec.WebsiteExposure = &garagev1beta1.WebsiteExposureConfig{
+		Ingress: &garagev1beta1.WebsiteExposureIngressConfig{},
+	}
+	bucket.Status.WebsiteExposure = &garagev1beta1.WebsiteExposureStatus{
+		Type: "Ingress", Name: "site-website", Namespace: "garage-ns",
+	}
+	ingress := &networkingv1.Ingress{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "site-website",
+			Namespace: "garage-ns",
+			Labels:    map[string]string{labelWebsiteExposureOwner: string(bucket.UID)},
+		},
+	}
+	// No GarageCluster object in the client at all.
+	c, scheme := websiteExposureTestClient(t, false, bucket, ingress)
+	r := &GarageBucketReconciler{Client: c, Scheme: scheme}
+
+	if err := r.cleanupWebsiteExposureOnDeletion(ctx, bucket); err != nil {
+		t.Fatalf("cleanup with a missing cluster: %v", err)
+	}
+	if err := c.Get(ctx, types.NamespacedName{Name: "site-website", Namespace: "garage-ns"}, ingress); !k8errors.IsNotFound(err) {
+		t.Fatalf("cross-namespace Ingress must be deleted without the cluster object: get err = %v", err)
+	}
+}
+
+// TestWebsiteExposureDeleteClusterGoneRetainsFinalizer drives Reconcile with a
+// deleting bucket whose cluster is gone and whose cross-namespace exposure
+// cannot be deleted: the finalizer must be retained (with a visible
+// condition and a retry), and the deletion must complete once the failure is
+// gone.
+func TestWebsiteExposureDeleteClusterGoneRetainsFinalizer(t *testing.T) {
+	ctx := context.Background()
+	now := metav1.Now()
+	bucket := websiteExposureTestBucket("apps")
+	bucket.Spec.ClusterRef = garagev1beta1.ClusterReference{Name: "garage", Namespace: "garage-ns"}
+	bucket.Finalizers = []string{garageBucketFinalizer}
+	bucket.DeletionTimestamp = &now
+	bucket.Spec.WebsiteExposure = &garagev1beta1.WebsiteExposureConfig{
+		Ingress: &garagev1beta1.WebsiteExposureIngressConfig{},
+	}
+	ingress := &networkingv1.Ingress{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "site-website",
+			Namespace: "garage-ns",
+			Labels:    map[string]string{labelWebsiteExposureOwner: string(bucket.UID)},
+		},
+	}
+
+	buildClient := func(failIngressDelete bool) (client.WithWatch, *runtime.Scheme) {
+		scheme := websiteExposureTestScheme(t)
+		base := fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithRESTMapper(websiteExposureTestRESTMapper(t, false)).
+			WithStatusSubresource(&garagev1beta1.GarageBucket{}).
+			WithObjects(bucket, ingress).
+			Build()
+		if !failIngressDelete {
+			return base, scheme
+		}
+		return interceptor.NewClient(base, interceptor.Funcs{
+			Delete: func(ctx context.Context, cl client.WithWatch, obj client.Object, _ ...client.DeleteOption) error {
+				if ing, ok := obj.(*networkingv1.Ingress); ok && ing.Name == "site-website" {
+					return fmt.Errorf("injected ingress delete failure")
+				}
+				return cl.Delete(ctx, obj)
+			},
+		}), scheme
+	}
+
+	// Round 1: the exposure delete fails, so the finalizer must be retained.
+	failing, failingScheme := buildClient(true)
+	r := &GarageBucketReconciler{Client: failing, Scheme: failingScheme}
+	result, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(bucket)})
+	if err != nil {
+		t.Fatalf("Reconcile (failing cleanup) error = %v, want a retryable status result", err)
+	}
+	if result.RequeueAfter != RequeueAfterError {
+		t.Fatalf("RequeueAfter = %v, want the error retry interval", result.RequeueAfter)
+	}
+	fresh := &garagev1beta1.GarageBucket{}
+	if err := failing.Get(ctx, client.ObjectKeyFromObject(bucket), fresh); err != nil {
+		t.Fatal(err)
+	}
+	if !controllerutil.ContainsFinalizer(fresh, garageBucketFinalizer) {
+		t.Fatalf("finalizer was removed although the cross-namespace exposure could not be deleted: %v", fresh.Finalizers)
+	}
+	still := &networkingv1.Ingress{}
+	if err := failing.Get(ctx, types.NamespacedName{Name: "site-website", Namespace: "garage-ns"}, still); err != nil {
+		t.Fatalf("Ingress must still exist after a failed cleanup: %v", err)
+	}
+	blocked := meta.FindStatusCondition(fresh.Status.Conditions, garagev1beta1.ConditionDeletionBlocked)
+	if blocked == nil || blocked.Status != metav1.ConditionTrue || !strings.Contains(blocked.Message, "website exposure cleanup") {
+		t.Fatalf("DeletionBlocked condition = %+v, want True with a cleanup message", blocked)
+	}
+
+	// Round 2: the failure is gone, so the finalizer must be removed (the
+	// deleting bucket then disappears) and the exposure deleted.
+	healthy, healthyScheme := buildClient(false)
+	r2 := &GarageBucketReconciler{Client: healthy, Scheme: healthyScheme}
+	if _, err := r2.Reconcile(ctx, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(bucket)}); err != nil {
+		t.Fatalf("Reconcile (healthy cleanup) error = %v", err)
+	}
+	if err := healthy.Get(ctx, client.ObjectKeyFromObject(bucket), fresh); !k8errors.IsNotFound(err) {
+		t.Fatalf("bucket must be fully finalized (gone) after a successful cleanup: get err = %v", err)
+	}
+	if err := healthy.Get(ctx, types.NamespacedName{Name: "site-website", Namespace: "garage-ns"}, still); !k8errors.IsNotFound(err) {
+		t.Fatalf("cross-namespace Ingress must be deleted before the finalizer is removed: get err = %v", err)
 	}
 }

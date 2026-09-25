@@ -27,6 +27,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/go-logr/logr"
 	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -124,12 +125,13 @@ func (r *GarageBucketReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		}
 		if controllerutil.ContainsFinalizer(bucket, garageBucketFinalizer) {
 			// Cross-namespace exposures have no owner reference, so remove them
-			// before the finalizer goes.
-			r.cleanupWebsiteExposureOnDeletion(ctx, bucket)
-			controllerutil.RemoveFinalizer(bucket, garageBucketFinalizer)
-			if err := r.Update(ctx, bucket); err != nil && !errors.IsNotFound(err) {
+			// before the finalizer goes. A failed cleanup retains the
+			// finalizer so the exposure is not orphaned.
+			result, err := r.removeFinalizerAfterExposureCleanup(ctx, log, bucket)
+			if err != nil {
 				return ctrl.Result{}, err
 			}
+			return result, nil
 		}
 		return ctrl.Result{}, nil
 	}
@@ -138,13 +140,13 @@ func (r *GarageBucketReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		if policy == garagev1beta1.BucketDeletionPolicyRetain && !isCOSIManagedPendingOrBoundShadow(bucket) {
 			log.Info("Retaining Garage bucket", "bucketID", bucket.Status.BucketID)
 			// Cross-namespace exposures have no owner reference, so remove them
-			// before the finalizer goes.
-			r.cleanupWebsiteExposureOnDeletion(ctx, bucket)
-			controllerutil.RemoveFinalizer(bucket, garageBucketFinalizer)
-			if err := r.Update(ctx, bucket); err != nil && !errors.IsNotFound(err) {
+			// before the finalizer goes. A failed cleanup retains the
+			// finalizer so the exposure is not orphaned.
+			result, err := r.removeFinalizerAfterExposureCleanup(ctx, log, bucket)
+			if err != nil {
 				return ctrl.Result{}, err
 			}
-			return ctrl.Result{}, nil
+			return result, nil
 		}
 		if policy != garagev1beta1.BucketDeletionPolicyDelete {
 			return r.updateStatus(ctx, bucket, PhaseDeleting, fmt.Errorf("unsupported deletionPolicy %q", bucket.Spec.DeletionPolicy))
@@ -199,11 +201,14 @@ func (r *GarageBucketReconciler) Reconcile(ctx context.Context, req ctrl.Request
 					return ctrl.Result{RequeueAfter: RequeueAfterShort}, nil
 				}
 				log.Info("Cluster is gone, skipping bucket finalization", "cluster", bucket.Spec.ClusterRef.Name)
-				controllerutil.RemoveFinalizer(bucket, garageBucketFinalizer)
-				if err := r.Update(ctx, bucket); err != nil {
+				// A cross-namespace exposure has no owner reference and its
+				// cluster is gone, so it can only be removed here. A failed
+				// cleanup retains the finalizer so the exposure is not orphaned.
+				result, err := r.removeFinalizerAfterExposureCleanup(ctx, log, bucket)
+				if err != nil {
 					return ctrl.Result{}, err
 				}
-				return ctrl.Result{}, nil
+				return result, nil
 			}
 		}
 	}
@@ -290,8 +295,19 @@ func (r *GarageBucketReconciler) Reconcile(ctx context.Context, req ctrl.Request
 			// Remove any website exposure resource before finalizing. Same-
 			// namespace exposures are also garbage-collected via their owner
 			// reference, but the cross-namespace case has no owner reference.
+			// A failed cleanup retains the finalizer so the exposure is not
+			// orphaned.
 			if err := r.deleteWebsiteExposureResource(ctx, bucket, cluster.Namespace); err != nil {
-				log.Error(err, "Failed to delete website exposure resource during finalization")
+				log.Error(err, "Failed to delete website exposure resource during finalization, retaining finalizer")
+				meta.SetStatusCondition(&bucket.Status.Conditions, metav1.Condition{
+					Type:               garagev1beta1.ConditionDeletionBlocked,
+					Status:             metav1.ConditionTrue,
+					Reason:             garagev1beta1.ReasonReconcileFailed,
+					Message:            "bucket deletion is waiting for website exposure cleanup: " + err.Error(),
+					ObservedGeneration: bucket.Generation,
+				})
+				_, _ = r.updateStatus(ctx, bucket, PhaseDeleting, fmt.Errorf("website exposure cleanup failed: %w", err))
+				return ctrl.Result{RequeueAfter: RequeueAfterError}, nil
 			}
 			if err := r.finalize(ctx, bucket, garageClient); err != nil {
 				// Patch annotation first — Patch avoids ResourceVersion conflicts with
@@ -405,6 +421,35 @@ func (r *GarageBucketReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		result.RequeueAfter = exposureResult.RequeueAfter
 	}
 	return result, nil
+}
+
+// removeFinalizerAfterExposureCleanup removes the bucket finalizer only after
+// the website exposure resource (if any) has been deleted. Same-namespace
+// exposures are additionally garbage-collected via their owner reference, but
+// cross-namespace exposures carry none, so a failed cleanup here would orphan
+// the resource: the finalizer is retained and the deletion is retried.
+func (r *GarageBucketReconciler) removeFinalizerAfterExposureCleanup(
+	ctx context.Context,
+	log logr.Logger,
+	bucket *garagev1beta1.GarageBucket,
+) (ctrl.Result, error) {
+	if err := r.cleanupWebsiteExposureOnDeletion(ctx, bucket); err != nil {
+		log.Error(err, "Failed to delete website exposure resource, retaining finalizer")
+		meta.SetStatusCondition(&bucket.Status.Conditions, metav1.Condition{
+			Type:               garagev1beta1.ConditionDeletionBlocked,
+			Status:             metav1.ConditionTrue,
+			Reason:             garagev1beta1.ReasonReconcileFailed,
+			Message:            "bucket deletion is waiting for website exposure cleanup: " + err.Error(),
+			ObservedGeneration: bucket.Generation,
+		})
+		_, _ = r.updateStatus(ctx, bucket, PhaseDeleting, fmt.Errorf("website exposure cleanup failed: %w", err))
+		return ctrl.Result{RequeueAfter: RequeueAfterError}, nil
+	}
+	controllerutil.RemoveFinalizer(bucket, garageBucketFinalizer)
+	if err := r.Update(ctx, bucket); err != nil && !errors.IsNotFound(err) {
+		return ctrl.Result{}, err
+	}
+	return ctrl.Result{}, nil
 }
 
 func isCOSIManagedPendingOrBoundShadow(object metav1.Object) bool {

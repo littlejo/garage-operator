@@ -527,9 +527,12 @@ the cluster's web API Service:
 - The resource is named `<bucket>-website` and is created **in the cluster's
   namespace** (Ingress backends cannot cross namespaces; a cross-namespace
   HTTPRoute backend would additionally need a ReferenceGrant). A controller
-  owner reference is set only when bucket and cluster share a namespace; in
-  the cross-namespace case `deleteWebsiteExposureResource` cleans up
-  explicitly (finalizer, Retain, and COSI-retain paths).
+  owner reference is set only when bucket and cluster share a namespace; a
+  cross-namespace resource instead carries the durable ownership label
+  `garage.rajsingh.info/website-exposure-owner=<bucket UID>` and is cleaned
+  up explicitly (finalizer, Retain, and COSI-retain paths), which retain the
+  bucket finalizer until the deletion succeeds so the exposure is never
+  orphaned.
 - Host is `<globalAlias><webApi.rootDomain>` by default; an explicit
   `spec.websiteExposure.host` must match that exact pattern (Garage resolves
   the bucket from the Host header, so any other host is a 404). A not-yet

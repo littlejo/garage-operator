@@ -255,7 +255,7 @@ func (r *GarageBucketReconciler) finishWebsiteExposure(
 	}
 	// A foreign object squatting the generated name, or a missing RBAC grant,
 	// will not heal by fast retry; back off to the drift interval.
-	if strings.Contains(err.Error(), "not controlled by") || k8errors.IsForbidden(err) {
+	if strings.Contains(err.Error(), "not owned by") || k8errors.IsForbidden(err) {
 		return ctrl.Result{RequeueAfter: RequeueAfterDrift}, nil
 	}
 	return ctrl.Result{RequeueAfter: RequeueAfterError}, nil
@@ -295,6 +295,36 @@ func (r *GarageBucketReconciler) persistWebsiteExposureStatus(
 	return UpdateStatusWithRetry(ctx, r.Client, bucket)
 }
 
+// websiteExposureBaseLabels returns the operator-set labels for a generated
+// exposure resource. In the cross-namespace case (where no controller owner
+// reference can be set) the bucket's UID is recorded as a durable ownership
+// marker so later reconciles and deletions can recognize the operator's own
+// object.
+func websiteExposureBaseLabels(bucket *garagev1beta1.GarageBucket, cluster *garagev1beta2.GarageCluster) map[string]string {
+	labels := map[string]string{
+		labelAppManagedBy: "garage-operator",
+		labelBucketRef:    bucket.Name,
+	}
+	if bucket.Namespace != cluster.Namespace {
+		labels[labelWebsiteExposureOwner] = string(bucket.UID)
+	}
+	return labels
+}
+
+// isWebsiteExposureOwned reports whether an existing exposure resource is
+// owned by the bucket: by controller owner reference (same-namespace) or by
+// the durable UID label (cross-namespace, where no owner reference can be
+// set).
+func isWebsiteExposureOwned(obj client.Object, bucket *garagev1beta1.GarageBucket, cluster *garagev1beta2.GarageCluster) bool {
+	if metav1.IsControlledBy(obj, bucket) {
+		return true
+	}
+	if bucket.Namespace == cluster.Namespace {
+		return false
+	}
+	return obj.GetLabels()[labelWebsiteExposureOwner] == string(bucket.UID)
+}
+
 // buildIngress constructs the desired Ingress for a website-enabled bucket.
 func (r *GarageBucketReconciler) buildIngress(
 	bucket *garagev1beta1.GarageBucket,
@@ -308,10 +338,7 @@ func (r *GarageBucketReconciler) buildIngress(
 	}
 	svcName := websiteExposureBackend(cluster)
 
-	labels := mergeLabels(map[string]string{
-		labelAppManagedBy: "garage-operator",
-		labelBucketRef:    bucket.Name,
-	}, ingressConfig.Labels)
+	labels := mergeLabels(websiteExposureBaseLabels(bucket, cluster), ingressConfig.Labels)
 
 	pathType := networkingv1.PathTypePrefix
 	var tls []networkingv1.IngressTLS
@@ -409,10 +436,7 @@ func (r *GarageBucketReconciler) buildHTTPRoute(
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      websiteExposureResourceName(bucket),
 			Namespace: websiteExposureNamespace(cluster),
-			Labels: map[string]string{
-				labelAppManagedBy: "garage-operator",
-				labelBucketRef:    bucket.Name,
-			},
+			Labels:    websiteExposureBaseLabels(bucket, cluster),
 		},
 		Spec: gatewayv1.HTTPRouteSpec{
 			CommonRouteSpec: gatewayv1.CommonRouteSpec{
@@ -452,10 +476,10 @@ func (r *GarageBucketReconciler) buildHTTPRoute(
 // applyWebsiteExposureResource creates or updates the desired exposure
 // resource. The controller owner reference is only set when bucket and
 // cluster share a namespace (Kubernetes forbids cross-namespace owner
-// references); otherwise the bucket controller deletes the resource
-// explicitly. Ownership is enforced by exact UID, mirroring
-// reconcileService: a foreign object squatting on the generated name is
-// never mutated.
+// references); cross-namespace objects carry the durable
+// labelWebsiteExposureOwner UID marker instead. Ownership is enforced by
+// exact UID, mirroring reconcileService: a foreign object squatting on the
+// generated name is never mutated.
 func (r *GarageBucketReconciler) applyWebsiteExposureResource(
 	ctx context.Context,
 	bucket *garagev1beta1.GarageBucket,
@@ -480,15 +504,30 @@ func (r *GarageBucketReconciler) applyWebsiteExposureResource(
 	if err != nil {
 		return err
 	}
-	if !metav1.IsControlledBy(existing, bucket) {
-		return fmt.Errorf("refusing to mutate website exposure resource %s/%s because it is not controlled by GarageBucket UID %s",
+	if !isWebsiteExposureOwned(existing, bucket, cluster) {
+		return fmt.Errorf("refusing to mutate website exposure resource %s/%s because it is not owned by GarageBucket UID %s",
 			existing.GetNamespace(), existing.GetName(), bucket.UID)
+	}
+	// A cross-namespace object created before the UID marker existed (or whose
+	// label was stripped) is claimed on update so later reconciles and the
+	// cluster-gone deletion path keep recognizing it.
+	if bucket.Namespace != cluster.Namespace && existing.GetLabels()[labelWebsiteExposureOwner] == "" {
+		if existing.GetLabels() == nil {
+			existing.SetLabels(map[string]string{})
+		}
+		existing.GetLabels()[labelWebsiteExposureOwner] = string(bucket.UID)
 	}
 
 	switch d := desired.(type) {
 	case *networkingv1.Ingress:
 		e := existing.(*networkingv1.Ingress)
 		e.OwnerReferences = d.OwnerReferences
+		if e.Labels == nil {
+			e.Labels = map[string]string{}
+		}
+		for k, v := range d.Labels {
+			e.Labels[k] = v
+		}
 		e.Spec = d.Spec
 		if err := r.Update(ctx, e); err != nil {
 			return fmt.Errorf("updating Ingress: %w", err)
@@ -497,6 +536,12 @@ func (r *GarageBucketReconciler) applyWebsiteExposureResource(
 	case *gatewayv1.HTTPRoute:
 		e := existing.(*gatewayv1.HTTPRoute)
 		e.OwnerReferences = d.OwnerReferences
+		if e.Labels == nil {
+			e.Labels = map[string]string{}
+		}
+		for k, v := range d.Labels {
+			e.Labels[k] = v
+		}
 		e.Spec = d.Spec
 		if err := r.Update(ctx, e); err != nil {
 			return fmt.Errorf("updating HTTPRoute: %w", err)
@@ -507,24 +552,20 @@ func (r *GarageBucketReconciler) applyWebsiteExposureResource(
 	}
 }
 
-// cleanupWebsiteExposureOnDeletion best-effort removes the exposure resource
-// when the bucket is deleted through a path that does not run the full
-// finalize (deletionPolicy: Retain, COSI retain). It resolves the cluster
-// namespace from spec.clusterRef; a missing cluster leaves the exposure to
-// owner-reference garbage collection (same-namespace installs) and is not an
-// error.
-func (r *GarageBucketReconciler) cleanupWebsiteExposureOnDeletion(ctx context.Context, bucket *garagev1beta1.GarageBucket) {
-	cluster := &garagev1beta2.GarageCluster{}
+// cleanupWebsiteExposureOnDeletion removes the exposure resource when the
+// bucket is deleted through a path that does not run the full finalize
+// (deletionPolicy: Retain, COSI retain). The cluster namespace is derived
+// from spec.clusterRef, so cleanup works even when the cluster object is
+// gone or deleting: same-namespace exposures are additionally garbage
+// collected via their owner reference, but cross-namespace ones have none.
+// A returned error must retain the bucket finalizer and retry — leaving it
+// behind would orphan the exposure.
+func (r *GarageBucketReconciler) cleanupWebsiteExposureOnDeletion(ctx context.Context, bucket *garagev1beta1.GarageBucket) error {
 	clusterNamespace := bucket.Spec.ClusterRef.Namespace
 	if clusterNamespace == "" {
 		clusterNamespace = bucket.Namespace
 	}
-	if err := r.Get(ctx, types.NamespacedName{Name: bucket.Spec.ClusterRef.Name, Namespace: clusterNamespace}, cluster); err != nil {
-		return
-	}
-	if err := r.deleteWebsiteExposureResource(ctx, bucket, websiteExposureNamespace(cluster)); err != nil {
-		logf.FromContext(ctx).V(1).Info("Website exposure cleanup on deletion incomplete", "error", err.Error())
-	}
+	return r.deleteWebsiteExposureResource(ctx, bucket, clusterNamespace)
 }
 
 // deleteWebsiteExposureResource removes the exposure resource when
@@ -532,19 +573,31 @@ func (r *GarageBucketReconciler) cleanupWebsiteExposureOnDeletion(ctx context.Co
 // objects are left untouched. When bucket and cluster share a namespace,
 // Kubernetes garbage collection also removes the controller-owned resource on
 // bucket deletion; this call covers the cross-namespace case, where no owner
-// reference can be set, and the spec-removal case. namespace is the cluster's
-// namespace (see websiteExposureNamespace).
+// reference can be set (ownership is recognized via the durable UID label),
+// and the spec-removal case. namespace is the cluster's namespace (see
+// websiteExposureNamespace).
 func (r *GarageBucketReconciler) deleteWebsiteExposureResource(
 	ctx context.Context,
 	bucket *garagev1beta1.GarageBucket,
 	namespace string,
 ) error {
+	// A bucket that never had a website exposure has nothing to clean up.
+	// The status record is the durable marker (the spec field is cleared when
+	// the exposure is removed), so both being unset means no resource was
+	// ever created and the probe can be skipped.
+	if bucket.Spec.WebsiteExposure == nil && bucket.Status.WebsiteExposure == nil {
+		return nil
+	}
+
 	name := websiteExposureResourceName(bucket)
+	cluster := &garagev1beta2.GarageCluster{
+		ObjectMeta: metav1.ObjectMeta{Namespace: namespace},
+	}
 
 	ingress := &networkingv1.Ingress{}
 	err := r.Get(ctx, types.NamespacedName{Name: name, Namespace: namespace}, ingress)
 	if err == nil {
-		if metav1.IsControlledBy(ingress, bucket) {
+		if isWebsiteExposureOwned(ingress, bucket, cluster) {
 			logf.FromContext(ctx).Info("Deleting website exposure Ingress", "name", name)
 			if err := r.Delete(ctx, ingress); err != nil && !k8errors.IsNotFound(err) {
 				return fmt.Errorf("deleting Ingress: %w", err)
@@ -558,7 +611,7 @@ func (r *GarageBucketReconciler) deleteWebsiteExposureResource(
 		route := &gatewayv1.HTTPRoute{}
 		err := r.Get(ctx, types.NamespacedName{Name: name, Namespace: namespace}, route)
 		if err == nil {
-			if metav1.IsControlledBy(route, bucket) {
+			if isWebsiteExposureOwned(route, bucket, cluster) {
 				logf.FromContext(ctx).Info("Deleting website exposure HTTPRoute", "name", name)
 				if err := r.Delete(ctx, route); err != nil && !k8errors.IsNotFound(err) {
 					return fmt.Errorf("deleting HTTPRoute: %w", err)

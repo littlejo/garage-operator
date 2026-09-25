@@ -34,8 +34,11 @@ global alias followed by the cluster's `webApi.rootDomain`).
   namespaces, so the exposure resource is created in the **cluster's**
   namespace, next to the web API Service. Kubernetes also forbids
   cross-namespace owner references, so in that case the resource cannot be
-  GC'd by the bucket and the bucket controller removes it explicitly on
-  deletion (finalize, Retain policy, COSI retain paths).
+  GC'd by the bucket: it instead carries a durable, collision-safe ownership
+  label `garage.rajsingh.info/website-exposure-owner=<bucket UID>` (set only
+  in the cross-namespace case), and the bucket controller removes it
+  explicitly on deletion (finalize, Retain policy, COSI retain paths) —
+  retaining the bucket finalizer until that cleanup succeeds.
 - The feature must be optional: an unset `spec.websiteExposure` changes
   nothing.
 
