@@ -123,6 +123,9 @@ func (r *GarageBucketReconciler) Reconcile(ctx context.Context, req ctrl.Request
 			return ctrl.Result{}, nil
 		}
 		if controllerutil.ContainsFinalizer(bucket, garageBucketFinalizer) {
+			// Cross-namespace exposures have no owner reference, so remove them
+			// before the finalizer goes.
+			r.cleanupWebsiteExposureOnDeletion(ctx, bucket)
 			controllerutil.RemoveFinalizer(bucket, garageBucketFinalizer)
 			if err := r.Update(ctx, bucket); err != nil && !errors.IsNotFound(err) {
 				return ctrl.Result{}, err
@@ -134,6 +137,9 @@ func (r *GarageBucketReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		policy := bucket.Spec.EffectiveDeletionPolicy()
 		if policy == garagev1beta1.BucketDeletionPolicyRetain && !isCOSIManagedPendingOrBoundShadow(bucket) {
 			log.Info("Retaining Garage bucket", "bucketID", bucket.Status.BucketID)
+			// Cross-namespace exposures have no owner reference, so remove them
+			// before the finalizer goes.
+			r.cleanupWebsiteExposureOnDeletion(ctx, bucket)
 			controllerutil.RemoveFinalizer(bucket, garageBucketFinalizer)
 			if err := r.Update(ctx, bucket); err != nil && !errors.IsNotFound(err) {
 				return ctrl.Result{}, err
@@ -281,6 +287,12 @@ func (r *GarageBucketReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	// Handle deletion (cluster exists at this point)
 	if !bucket.DeletionTimestamp.IsZero() {
 		if controllerutil.ContainsFinalizer(bucket, garageBucketFinalizer) {
+			// Remove any website exposure resource before finalizing. Same-
+			// namespace exposures are also garbage-collected via their owner
+			// reference, but the cross-namespace case has no owner reference.
+			if err := r.deleteWebsiteExposureResource(ctx, bucket, cluster.Namespace); err != nil {
+				log.Error(err, "Failed to delete website exposure resource during finalization")
+			}
 			if err := r.finalize(ctx, bucket, garageClient); err != nil {
 				// Patch annotation first — Patch avoids ResourceVersion conflicts with
 				// the subsequent status update, ensuring the retry counter is persisted
@@ -376,7 +388,23 @@ func (r *GarageBucketReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		return r.updateStatus(ctx, bucket, PhaseFailed, err)
 	}
 
-	return r.updateStatusFromGarage(ctx, bucket, garageClient, cluster, reconcileSnapshot)
+	result, err := r.updateStatusFromGarage(ctx, bucket, garageClient, cluster, reconcileSnapshot)
+	if err != nil {
+		return result, err
+	}
+
+	// Website exposure (Ingress/HTTPRoute) reconciles after the status update:
+	// updateStatusFromGarage snapshots the old status for its no-op comparison,
+	// so exposure status mutations must happen after it. Exposure failures are
+	// surfaced on the WebsiteExposed condition and never fail the bucket.
+	exposureResult, exposureErr := r.reconcileWebsiteExposure(ctx, bucket, cluster)
+	if exposureErr != nil {
+		return exposureResult, exposureErr
+	}
+	if exposureResult.RequeueAfter > 0 && (result.RequeueAfter == 0 || exposureResult.RequeueAfter < result.RequeueAfter) {
+		result.RequeueAfter = exposureResult.RequeueAfter
+	}
+	return result, nil
 }
 
 func isCOSIManagedPendingOrBoundShadow(object metav1.Object) bool {

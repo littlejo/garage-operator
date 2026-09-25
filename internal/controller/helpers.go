@@ -183,6 +183,10 @@ const (
 	labelAppManagedBy = "app.kubernetes.io/managed-by"
 )
 
+// labelBucketRef marks operator-generated bucket-scoped resources (website
+// exposure Ingress/HTTPRoute) with the GarageBucket they belong to.
+const labelBucketRef = "garage.rajsingh.info/bucket"
+
 // Volume and mount name constants
 const (
 	configVolumeName          = "config"
