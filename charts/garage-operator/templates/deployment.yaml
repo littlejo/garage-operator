@@ -68,6 +68,9 @@ spec:
         - --cosi-driver-name={{ .Values.cosi.driverName }}
         - --cosi-namespace={{ .Values.cosi.namespace | default .Release.Namespace }}
         {{- end }}
+        {{- if .Values.gatewayAPI.enabled }}
+        - --enable-gateway-api
+        {{- end }}
         {{- if ne .Values.clusterDomain "cluster.local" }}
         - --cluster-domain={{ .Values.clusterDomain }}
         {{- end }}

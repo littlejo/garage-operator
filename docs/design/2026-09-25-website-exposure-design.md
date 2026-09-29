@@ -19,28 +19,33 @@ global alias followed by the cluster's `webApi.rootDomain`).
   configurable, TLS stays the ingress/Gateway controller's job (see
   "Open questions below").
 - Garage resolves the bucket from the `Host` header
-  (`host_to_bucket` in upstream `src/api/common/helpers.rs`): the host must
-  be `<alias><rootDomain>`, e.g. `myalias.example.com` with
-  `rootDomain: ".example.com"`. The generated routing resource must therefore
-  carry that hostname and must not be a catch-all.
-- The web API Service is the cluster-level in-cluster API Service
-  (`<cluster>` in the cluster namespace — or `<cluster>-gateway` for
-  gateway-only clusters), which already exposes the `web` port
-  (`<cluster>-web` ServicePort is not used; the port is named `web`). The
-  exposure resource must reference that existing Service rather than
-  introducing a new proxy.
+  (`host_to_bucket` in upstream `src/api/common/helpers.rs`): when the Host
+  has the cluster's `webApi.rootDomain` as a suffix, the remainder is used as
+  the alias, and **otherwise the full Host is used as the alias**
+  (`host_to_bucket(host).unwrap_or(host)`). The canonical hostname is
+  `<alias><rootDomain>` (e.g. `myalias.example.com` with
+  `rootDomain: ".example.com"`); a bare alias also resolves. The generated
+  routing resource must never be a catch-all.
+- The web API Service is the cluster's in-cluster API Service, which already
+  exposes the `web` port (port name `web` for Ingress backends, the effective
+  web API port number for HTTPRoute backends). The exposure resource must
+  reference that existing Service rather than introducing a new proxy:
+  `<cluster>-gateway` for unified clusters (the gateway tier, where S3/Web
+  traffic terminates), `<cluster>` otherwise.
 - Buckets may live in a different namespace than their cluster (cross-
-  namespace via `GarageReferenceGrant`). An Ingress backend cannot cross
-  namespaces, so the exposure resource is created in the **cluster's**
-  namespace, next to the web API Service. Kubernetes also forbids
-  cross-namespace owner references, so in that case the resource cannot be
-  GC'd by the bucket: it instead carries a durable, collision-safe ownership
-  label `garage.rajsingh.info/website-exposure-owner=<bucket UID>` (set only
-  in the cross-namespace case), and the bucket controller removes it
-  explicitly on deletion (finalize, Retain policy, COSI retain paths) —
-  retaining the bucket finalizer until that cleanup succeeds.
+  namespace via `GarageReferenceGrant`). The exposure resource is created in
+  the **bucket's** namespace and always carries a controller owner reference
+  to the bucket (same namespace ⇒ garbage-collected with it, and no
+  `<bucket>-website` name clash between namespaces). An Ingress backend
+  cannot cross namespaces, so **Ingress exposure is only valid when the
+  bucket and the cluster share a namespace**. An HTTPRoute backend reference
+  crosses to the cluster's namespace and is gated by a Gateway API
+  `ReferenceGrant` in that namespace (owned by the storage admin) — the
+  intended Gateway API model, which also keeps a `GarageReferenceGrant` from
+  quietly becoming permission to publish routes (with arbitrary annotations)
+  from the storage namespace.
 - The feature must be optional: an unset `spec.websiteExposure` changes
-  nothing.
+  nothing, and it requires `spec.website.enabled: true`.
 
 ## API
 
@@ -53,40 +58,56 @@ spec:
     enabled: true
     indexDocument: index.html
   websiteExposure:
-    host: www.example.com     # required for gateway; ingress may derive it
-    tlsSecretName: my-tls     # optional, Ingress only
-    ingress:
+    hostnames: [www.example.com]   # optional; default <globalAlias><webApi.rootDomain>
+    # backendRef:                   # optional backend override
+    #   name: garage
+    #   kind: ServiceImport
+    #   group: multicluster.x-k8s.io
+    #   namespace: garage-ns
+    ingress:                        # exactly one of ingress / gateway
       ingressClassName: traefik
+      tlsSecretName: my-tls         # optional, Ingress only (bucket's namespace)
       labels: {...}
       annotations: {...}
-    gateway:
-      parentRefs:
-        - name: public-gateway
-          sectionName: http
+    # gateway:
+    #   parentRefs:                 # embedded gatewayv1.ParentReference
+    #     - name: public-gateway
+    #       sectionName: http
+    #   labels: {...}
+    #   annotations: {...}
 ```
 
-- At most one of `ingress` / `gateway` may be set (webhook-validated).
-- `host` is the external hostname. For `ingress`, when `host` is empty it is
-  derived as `status.globalAlias + webApi.rootDomain` (effective cluster
-  config), matching what Garage expects in `Host` and what
-  `status.websiteUrl` already publishes. For `gateway`, an explicit `host` is
-  required: an HTTPRoute with an empty `hostnames` entry is a wildcard route
-  that would match any hostname the listener accepts, which is not a safe
-  default for a bucket site.
-- `tlsSecretName` maps to `Ingress.spec.tls`. TLS termination itself remains
-  the ingress controller's concern.
-- Labels/annotations on the Ingress are merged the same way as other
-  operator-managed metadata: operator keys win on conflict, foreign keys are
-  preserved via the existing `mergeOwnedMetadata`/`applyOwnedMetadata` path.
-- `parentRefs` are passed through verbatim to `HTTPRoute.spec.parentRefs`.
+- At most one of `ingress` / `gateway` may be set (webhook-validated), and
+  `websiteExposure` requires `spec.website.enabled: true`.
+- `hostnames` are the external hostnames the exposure routes on. When empty
+  the single canonical hostname `status.globalAlias + webApi.rootDomain`
+  (effective cluster config) is used. Wildcards and duplicates are rejected.
+  Because Garage falls back to the full Host as the alias, a hostname equal
+  to the global alias also resolves. For an `HTTPRoute`, a hostname that is
+  neither canonical nor the bare alias gets a `URLRewrite` filter rewriting
+  the Host header to the canonical host.
+- `backendRef` overrides the backend Service (e.g. a cross-namespace
+  `ServiceImport`). For an Ingress it must be a core/v1 Service in the
+  bucket's namespace. The port is always the cluster's effective web API
+  port.
+- `ingress.tlsSecretName` maps to `Ingress.spec.tls`. TLS termination itself
+  remains the ingress controller's concern; an HTTPRoute's TLS is on the
+  parent `Gateway`.
+- Labels/annotations on both resource kinds are merged the same way as other
+  operator-managed metadata: operator keys win on conflict, foreign keys
+  (external-dns, cert-manager, …) are preserved via
+  `mergeOwnedMetadata`/`applyOwnedMetadata`.
+- `parentRefs` are embedded upstream `gatewayv1.ParentReference` values,
+  copied to `HTTPRoute.spec.parentRefs` with an omitted namespace defaulted
+  to the bucket's (the route's) namespace.
 
 ### Naming
 
-Generated resource name: `<bucket-name>-website` in the **cluster's**
-namespace (see Constraints above: Ingress backends cannot cross namespaces,
-and a cross-namespace HTTPRoute backendRef would need a ReferenceGrant). A
-name derived from the bucket name (not the cluster name) keeps it unique
-across clusters sharing a namespace.
+Generated resource name: `<bucket-name>-website` in the **bucket's**
+namespace (see Constraints above: an Ingress backend cannot cross namespaces,
+and a cross-namespace HTTPRoute backendRef is gated by a ReferenceGrant). A
+name derived from the bucket name, in the bucket's own namespace, is unique
+across clusters and cannot clash between namespaces.
 
 ## Reconciliation behavior
 
@@ -96,46 +117,54 @@ reconcile in the normal (non-deleting) path:
 - No `spec.websiteExposure` → ensure any previously generated resource is
   gone (delete the exact-owned one, leave foreign objects untouched).
 - `ingress` requested:
-  - `ingress` group is always available (core Kubernetes), so no CRD
-    discovery is needed.
-  - Host is `spec.websiteExposure.host` or the derived alias-based host.
-    While the bucket has no recorded global alias yet, the host cannot be
-    derived — the condition is set `False/Reason=WaitingForAlias` and the
-    reconcile retries on the short interval; no resource is created with the
-    wrong host. An explicit host is validated against the
-    `<alias><rootDomain>` pattern **at reconcile time**, not admission: the
-    alias lives in `status`, which the webhook does not read (and may not be
-    recorded on CREATE). A mismatched host fails the exposure reconcile with
-    `False/Reason=ReconcileFailed` and an explanatory message — only the
-    *bare* `<alias><rootDomain>` host resolves in Garage, so a mismatched
-    host would otherwise be a silent 404 site. The derived host (no explicit
-    `host`) is consistent by construction.
-  - The Ingress routes path `/` (Prefix) to the primary `<cluster>` Service
-    in the cluster's namespace, port name `web`. `tlsSecretName` fills
-    `spec.tls` with the resolved host.
-  - Controller owner reference is set only when bucket and cluster share a
-    namespace; otherwise the deletion paths (finalize, Retain, COSI retain)
-    call `deleteWebsiteExposureResource` explicitly.
+  - The `networking.k8s.io` group is always available (core Kubernetes), so
+    no CRD discovery is needed.
+  - Cross-namespace is rejected (webhook + controller): the Ingress would
+    have to target the cluster's web Service from another namespace.
+  - Hostnames are `spec.websiteExposure.hostnames` or the derived canonical
+    host. While the bucket has no recorded global alias yet, the canonical
+    host cannot be derived — the condition is set
+    `False/Reason=WaitingForAlias` and the reconcile retries on the short
+    interval; explicit hostnames work before the alias is recorded.
+  - The Ingress (one rule per hostname) routes path `/` (Prefix) to the
+    cluster's web API Service in the bucket's namespace, port name `web`
+    (`<cluster>-gateway` for unified clusters, `<cluster>` otherwise, or
+    `backendRef` for an Ingress). `ingress.tlsSecretName` fills `spec.tls`
+    with the hostnames.
 - `gateway` requested:
-  - The Gateway API CRDs are optional. The reconciler probes the REST mapper
-    for `gateway.networking.k8s.io/HTTPRoute` (same pattern as
-    `monitoringCRDExists`). Missing CRDs → condition
-    `False/Reason=GatewayAPIUnavailable`, no error, retried; this keeps
-    installations without the Gateway API unaffected.
-  - An `HTTPRoute` is created with `spec.hostnames: [host]`, one
-    `parentRefs` entry each, and a single rule: HTTPRouteMatch `{path:
-    {type: PathPrefix, value: "/"}}` → backendRef
-    `<cluster>` Service (cluster namespace), port `web`. The backendRef
-    points at the Service (not a Pod), so no cross-namespace ReferenceGrant
-    is needed for the backend; the parentRef may cross namespaces per the
-    user's `parentRefs`.
-  - Owner reference set as above.
+  - HTTPRoute creation and watching are gated on the operator being started
+    with `--enable-gateway-api` (or `ENABLE_GATEWAY_API`, like cert-manager)
+    AND the Gateway API CRDs being installed (REST mapper probe, same
+    pattern as `monitoringCRDExists`, so no informer starts without the
+    CRDs). Missing either → condition `False/Reason=GatewayAPIUnavailable`,
+    no error, retried at the drift interval.
+  - An `HTTPRoute` is created with `spec.hostnames` = the resolved
+    hostnames, the (copied) `parentRefs`, and one rule per hostname:
+    HTTPRouteMatch `{path: {type: PathPrefix, value: "/"}}`, a `URLRewrite`
+    hostname filter for non-canonical non-alias hostnames, and a backendRef
+    to the cluster's web API Service (cluster namespace, effective web port)
+    or `backendRef`. The cross-namespace backendRef needs the Gateway API
+    `ReferenceGrant` in the cluster's namespace.
+  - Readiness comes from the route's own `status.parents` (Accepted /
+    ResolvedRefs / Ready per parent), not from the fact that the operator
+    wrote the object: the controller owns and watches the
+    Ingress/HTTPRoute back to the bucket, so a Gateway that rejects the
+    route or a backend that does not resolve (missing ReferenceGrant,
+    unknown Service) keeps the condition `False/Reason=NotReady` with the
+    Gateway's message and a short requeue until it changes.
+- A controller owner reference is always set (bucket's namespace), and
+  switching the spec from `ingress` to `gateway` (or removing
+  `websiteExposure`) deletes the other kind of generated resource.
 - On any success/failure a `WebsiteExposed` status condition is maintained:
   - `True/Reason=Exposed` with the message naming the resource
     (`Ingress <ns>/<name>` or `HTTPRoute <ns>/<name>`).
   - `False/Reason=WaitingForAlias`, `False/Reason=GatewayAPIUnavailable`,
+    `False/Reason=NotReady` (HTTPRoute parent status not yet ready),
     `False/Reason=ReconcileFailed` (message carries the error) otherwise.
   - The condition is removed entirely when `spec.websiteExposure` is unset.
+  - `status.websiteExposure` mirrors the observed resource: `type`, `name`,
+    `hostnames`, and for an HTTPRoute the per-parent
+    `Accepted`/`ResolvedRefs`/`Ready` flags.
 - `status.websiteUrl` is unchanged: it already publishes
   `scheme://alias.rootDomain` from the cluster's effective `webApi` config
   and remains the authoritative advertised URL.
@@ -173,34 +202,42 @@ not a `PhaseFailed` — the bucket itself is ready either way.
 
 ## Failure modes
 
-- Host derivation before the alias is recorded → wait-and-retry condition,
-  no partial resource.
-- Explicit host that does not match `<alias><rootDomain>` → the exposure
-  reconcile fails with `False/Reason=ReconcileFailed` (message explains
-  Garage's host-based bucket resolution); the bucket itself stays ready.
-- Gateway API absent → condition, no error, retried every reconcile cycle.
+- Canonical host derivation before the alias is recorded (and no explicit
+  hostnames) → wait-and-retry condition, no partial resource.
+- Gateway API disabled or CRDs absent → `False/GatewayAPIUnavailable`, no
+  error, retried at the drift interval.
+- Gateway does not accept the route, or the backend does not resolve
+  (missing ReferenceGrant, unknown Service) → the route's `status.parents`
+  keeps the condition `False/NotReady` with the Gateway's message; the
+  owned-route watch re-reconciles when the status changes.
 - Foreign object squatting on `<bucket>-website` → the operator refuses to
-  mutate it (exact-UID ownership check, same pattern as `reconcileService`)
-  and surfaces the error in the condition.
+  mutate it (controller owner reference check, same pattern as
+  `reconcileService`) and surfaces the error in the condition.
 - Cluster Service missing (cluster still bootstrapping) → the bucket gates
   on `cluster.Status.Phase == Running` before the exposure reconcile runs,
   same as the rest of bucket reconciliation.
 
 ## Test plan
 
-- Unit (envtest): Ingress create with derived host, explicit host,
-  tlsSecretName, labels/annotations merge; delete on spec removal; foreign
-  object refusal; no CRD impact for Ingress.
-- Unit (envtest with fake HTTPRoute): HTTPRoute create with parentRefs and
-  hostnames; missing-CRD path via a client whose mapper lacks the GVK
-  (condition only, no error); delete on spec removal.
-- Webhook: both ingress and gateway set → rejected; neither → rejected;
-  gateway without host → rejected; gateway parentRef without name → rejected.
-- Controller: explicit host not matching `<alias><rootDomain>` → condition
-  `False/ReconcileFailed`, no resource written; cross-namespace placement →
-  resource in the cluster namespace with no owner reference.
+- Unit (envtest): Ingress create with derived canonical host, explicit
+  hostnames, `ingress.tlsSecretName`, labels/annotations merge;
+  cross-namespace Ingress refused; delete on spec removal and on the
+  ingress↔gateway switch; foreign object refusal.
+- Unit (envtest with fake HTTPRoute): HTTPRoute create with parentRefs,
+  hostnames, and the default backend; URLRewrite filter for non-canonical
+  non-alias hostnames; `backendRef` override; readiness driven by simulated
+  `status.parents` (Accepted/ResolvedRefs/Ready), including a not-accepted
+  parent; missing-CRD and flag-disabled paths (condition only, no error);
+  delete on spec removal.
+- Webhook: exposure without `website.enabled` → rejected; both ingress and
+  gateway set → rejected; neither → rejected; duplicate hostnames →
+  rejected; cross-namespace Ingress → rejected; Ingress `backendRef` that is
+  not a same-namespace core/v1 Service → rejected; gateway parentRef without
+  name → rejected.
 - RBAC chart sync test already pins `config/rbac/role.yaml` against the
-  chart templates; the new ingress/httproutes rules must appear in both.
+  chart templates; the httproutes rule is gated on
+  `.Values.gatewayAPI.enabled` in the chart but stays unconditional in the
+  generated superset `config/rbac/role.yaml`.
 
 ## Documentation
 
@@ -212,10 +249,5 @@ not a `PhaseFailed` — the bucket itself is ready either way.
 
 ## Deferred
 
-- Per-`HTTPRoute` parentRef validation (the Gateway API itself reports
-  attachment status; the operator does not read it back).
 - TLS certificate provisioning (cert-manager etc.) — out of scope;
-  `tlsSecretName` only names an existing Secret.
-- `status` subresource back-population from the Gateway's `HTTPRouteStatus`
-  (e.g. `ParentRefsAccepted` reasons) — the condition is sufficient for the
-  first iteration.
+  `ingress.tlsSecretName` only names an existing Secret.

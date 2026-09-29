@@ -19,6 +19,7 @@ package v1beta1
 import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 )
 
 // GarageBucketSpec defines the desired state of GarageBucket
@@ -77,11 +78,11 @@ type GarageBucketSpec struct {
 	BucketID string `json:"bucketId,omitempty"`
 
 	// WebsiteExposure optionally exposes a website-enabled bucket through
-	// Kubernetes HTTP routing: an Ingress or a Gateway API HTTPRoute in the
-	// bucket's namespace, pointing at the cluster's web API Service. At most
-	// one of Ingress and Gateway may be set. See the websiteExposure
-	// documentation for the host semantics (Garage resolves the bucket from
-	// the Host header).
+	// Kubernetes HTTP routing: an Ingress or a Gateway API HTTPRoute, created
+	// in this bucket's namespace and pointing at the referenced cluster's web
+	// API Service. At most one of Ingress and Gateway may be set. Requires
+	// spec.website.enabled. See the websiteExposure documentation for the
+	// hostname semantics (Garage resolves the bucket from the Host header).
 	// +optional
 	WebsiteExposure *WebsiteExposureConfig `json:"websiteExposure,omitempty"`
 
@@ -168,42 +169,53 @@ type WebsiteConfig struct {
 }
 
 // WebsiteExposureConfig declares how the operator exposes a website-enabled
-// bucket over HTTP routing. The generated resource (Ingress or HTTPRoute)
-// lives in the referenced GarageCluster's namespace — next to the web API
-// Service it routes to (Ingress backends cannot cross namespaces) — is
-// controller-owned by the GarageBucket when bucket and cluster share a
-// namespace, and is otherwise cleaned up by the bucket controller on
-// deletion.
+// bucket over HTTP routing. The generated resource (Ingress or HTTPRoute) is
+// created in the bucket's namespace and controller-owned by the
+// GarageBucket. It routes to the referenced cluster's web API Service:
+// <cluster>-gateway for unified clusters, <cluster> otherwise, unless
+// BackendRef overrides the backend.
 //
-// Garage resolves the served bucket from the Host header: the host must be
-// the bucket's global alias followed by the cluster's webApi.rootDomain.
-// When Host is empty, the operator derives exactly that host from
-// status.globalAlias and the cluster's effective webApi configuration. An
-// explicit Host must therefore match the same pattern, which the validating
-// webhook enforces once the alias is known.
+// An Ingress backend cannot cross namespaces, so Ingress exposure is only
+// valid when the bucket and the referenced cluster share a namespace. An
+// HTTPRoute backend reference crosses to the cluster's namespace and
+// requires a gateway API ReferenceGrant in the cluster's namespace (owned
+// by the storage admin) allowing HTTPRoutes from the bucket's namespace.
+//
+// Garage resolves the served bucket from the request Host header: it uses
+// the Host with the cluster's webApi.rootDomain suffix removed when that
+// matches, and otherwise falls back to the full Host as the alias. When
+// Hostnames is empty, the operator uses the single canonical hostname
+// <globalAlias><webApi.rootDomain>. For an HTTPRoute, a hostname that is
+// neither canonical nor equal to the global alias is additionally matched
+// with a URLRewrite filter rewriting the Host header to the canonical host.
 type WebsiteExposureConfig struct {
-	// Host is the external hostname the exposure routes on. When empty, it is
-	// derived as <globalAlias><webApi.rootDomain> — the only form Garage's
-	// web API resolves to this bucket. Required for Gateway; Ingress may omit
-	// it to use the derived host.
-	// +kubebuilder:validation:MinLength=1
-	// +kubebuilder:validation:MaxLength=253
-	// +kubebuilder:validation:Pattern=`^[a-zA-Z0-9]([a-zA-Z0-9\-\.]*[a-zA-Z0-9])?$`
+	// Hostnames are the external hostnames the exposure routes on. When
+	// empty, the operator uses the single canonical hostname
+	// <globalAlias><webApi.rootDomain>. Wildcards and duplicates are not
+	// supported (duplicates are rejected by the validating webhook; the CRD
+	// schema cannot express uniqueItems).
+	// +kubebuilder:validation:MaxItems=16
+	// +kubebuilder:validation:Items:Type=string
+	// +kubebuilder:validation:Items:MinLength=1
+	// +kubebuilder:validation:Items:MaxLength=253
+	// +kubebuilder:validation:Items:Pattern=`^[a-zA-Z0-9]([a-zA-Z0-9\-\.]*[a-zA-Z0-9])?$`
 	// +optional
-	Host string `json:"host,omitempty"`
+	Hostnames []string `json:"hostnames,omitempty"`
 
-	// TLSSecretName is the name of a TLS Secret in the referenced cluster's
-	// namespace (where the generated Ingress lives), attached to the Ingress
-	// (spec.tls). The Secret must already exist; the operator does not
-	// provision certificates. Ignored for Gateway exposure, where TLS is
-	// configured on the Gateway listener.
-	// +kubebuilder:validation:MinLength=1
-	// +kubebuilder:validation:MaxLength=253
+	// BackendRef overrides the Service the exposure routes to. When unset,
+	// the operator targets the referenced cluster's web API Service
+	// (<cluster>-gateway for unified clusters, <cluster> otherwise). For an
+	// Ingress the referent must be a core/v1 Service in the bucket's
+	// namespace (Ingress backends cannot cross namespaces). For an
+	// HTTPRoute any referent valid for spec.rules[].backendRefs is
+	// accepted, including cross-namespace ones (which additionally need a
+	// gateway API ReferenceGrant).
 	// +optional
-	TLSSecretName string `json:"tlsSecretName,omitempty"`
+	BackendRef *WebsiteExposureBackendReference `json:"backendRef,omitempty"`
 
-	// Ingress configures the generated Kubernetes Ingress. Mutually exclusive
-	// with Gateway.
+	// Ingress configures the generated Kubernetes Ingress. Mutually
+	// exclusive with Gateway. Only valid when the bucket and the referenced
+	// cluster share a namespace.
 	// +optional
 	Ingress *WebsiteExposureIngressConfig `json:"ingress,omitempty"`
 
@@ -213,6 +225,36 @@ type WebsiteExposureConfig struct {
 	// bucket.
 	// +optional
 	Gateway *WebsiteExposureGatewayConfig `json:"gateway,omitempty"`
+}
+
+// WebsiteExposureBackendReference names the backend the exposure routes to
+// instead of the referenced cluster's web API Service. The web port is
+// selected by name ("web") for core/v1 Services and by the cluster's
+// effective web API port otherwise.
+type WebsiteExposureBackendReference struct {
+	// Group of the referent. Defaults to "" (the core API group).
+	// +kubebuilder:validation:MaxLength=253
+	// +optional
+	Group string `json:"group,omitempty"`
+
+	// Kind of the referent. Defaults to Service.
+	// +kubebuilder:validation:MaxLength=253
+	// +optional
+	Kind string `json:"kind,omitempty"`
+
+	// Namespace of the referent. Defaults to the bucket's namespace (the
+	// exposure resource's namespace). For an Ingress it must stay the
+	// bucket's namespace: Ingress backends cannot cross namespaces.
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=63
+	// +optional
+	Namespace string `json:"namespace,omitempty"`
+
+	// Name of the referent.
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=253
+	// +required
+	Name string `json:"name"`
 }
 
 // WebsiteExposureIngressConfig configures the Ingress the operator creates
@@ -225,6 +267,15 @@ type WebsiteExposureIngressConfig struct {
 	// +kubebuilder:validation:MaxLength=253
 	// +optional
 	IngressClassName string `json:"ingressClassName,omitempty"`
+
+	// TLSSecretName is the name of a TLS Secret in the bucket's namespace
+	// (where the generated Ingress lives), attached to the Ingress
+	// (spec.tls). The Secret must already exist; the operator does not
+	// provision certificates.
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=253
+	// +optional
+	TLSSecretName string `json:"tlsSecretName,omitempty"`
 
 	// Labels to add to the Ingress. Operator-managed labels take precedence
 	// on conflict.
@@ -245,41 +296,17 @@ type WebsiteExposureGatewayConfig struct {
 	// cross-namespace references). At least one is required.
 	// +kubebuilder:validation:MinItems=1
 	// +required
-	ParentRefs []ParentReferenceConfig `json:"parentRefs"`
-}
+	ParentRefs []gatewayv1.ParentReference `json:"parentRefs"`
 
-// ParentReferenceConfig is a reference to a Gateway (or other accepted
-// parent) for a generated HTTPRoute. Field semantics follow the Gateway
-// API ParentReference: Group defaults to gateway.networking.k8s.io, Kind
-// defaults to Gateway, and Namespace defaults to the HTTPRoute's namespace.
-type ParentReferenceConfig struct {
-	// Group of the referent. Defaults to gateway.networking.k8s.io.
-	// +kubebuilder:default="gateway.networking.k8s.io"
+	// Labels to add to the HTTPRoute (for example external-dns or
+	// argo-rollouts annotations). Operator-managed labels take precedence
+	// on conflict.
 	// +optional
-	Group string `json:"group,omitempty"`
+	Labels map[string]string `json:"labels,omitempty"`
 
-	// Kind of the referent. Defaults to Gateway.
-	// +kubebuilder:default="Gateway"
+	// Annotations to add to the HTTPRoute.
 	// +optional
-	Kind string `json:"kind,omitempty"`
-
-	// Namespace of the referent. Defaults to the HTTPRoute's namespace.
-	// +kubebuilder:validation:MinLength=1
-	// +kubebuilder:validation:MaxLength=63
-	// +optional
-	Namespace string `json:"namespace,omitempty"`
-
-	// Name of the referent.
-	// +kubebuilder:validation:MinLength=1
-	// +kubebuilder:validation:MaxLength=253
-	// +required
-	Name string `json:"name"`
-
-	// SectionName of the referent (for a Gateway: the listener name).
-	// +kubebuilder:validation:MinLength=1
-	// +kubebuilder:validation:MaxLength=253
-	// +optional
-	SectionName string `json:"sectionName,omitempty"`
+	Annotations map[string]string `json:"annotations,omitempty"`
 }
 
 // BucketLifecycle is a set of lifecycle rules applied to a bucket.
@@ -586,7 +613,9 @@ type WebsiteConfigStatus struct {
 }
 
 // WebsiteExposureStatus reports the generated websiteExposure routing
-// resource.
+// resource. Readiness is carried by the WebsiteExposed condition, derived
+// from the route's own status (parents Accepted/ResolvedRefs/Ready) for an
+// HTTPRoute and from the successful apply for an Ingress.
 type WebsiteExposureStatus struct {
 	// Type is the kind of routing resource the operator manages for this
 	// bucket: Ingress or HTTPRoute.
@@ -594,26 +623,45 @@ type WebsiteExposureStatus struct {
 	// +optional
 	Type string `json:"type,omitempty"`
 
-	// Name is the name of the generated resource.
+	// Name is the name of the generated resource, in the bucket's namespace.
 	// +optional
 	Name string `json:"name,omitempty"`
 
-	// Namespace is the namespace of the generated resource: the referenced
-	// GarageCluster's namespace, where the web API Service lives.
+	// Hostnames are the hostnames the generated resource routes on.
 	// +optional
-	Namespace string `json:"namespace,omitempty"`
+	Hostnames []string `json:"hostnames,omitempty"`
 
-	// Host is the hostname the exposure routes on.
+	// Parents mirrors the route's status.parents for an HTTPRoute: the
+	// per-parent Accepted/ResolvedRefs/Ready conditions the Gateway
+	// controllers publish. Empty for an Ingress, which has no per-parent
+	// readiness model.
 	// +optional
-	Host string `json:"host,omitempty"`
+	Parents []WebsiteParentStatus `json:"parents,omitempty"`
+}
 
-	// Ready is true when the exposure resource exists and matches the spec.
+// WebsiteParentStatus is the per-parent readiness of a generated HTTPRoute,
+// mirroring gateway.networking.k8s.io/v1 RouteParentStatus conditions.
+type WebsiteParentStatus struct {
+	// Parent is the parent Gateway (or other parent) as namespace/name.
 	// +optional
-	Ready bool `json:"ready"`
+	Parent string `json:"parent,omitempty"`
 
-	// Message carries a human-readable detail, including the reason when
-	// Ready is false (for example a missing Gateway API CRD or an alias not
-	// yet recorded).
+	// Accepted is true when the parent accepted the route
+	// (status.parents[].conditions[Accepted]=True).
+	// +optional
+	Accepted bool `json:"accepted,omitempty"`
+
+	// ResolvedRefs is true when the route's backend references resolved on
+	// that parent (status.parents[].conditions[ResolvedRefs]=True).
+	// +optional
+	ResolvedRefs bool `json:"resolvedRefs,omitempty"`
+
+	// Ready is true when the parent reports the route Ready
+	// (status.parents[].conditions[Ready]=True).
+	// +optional
+	Ready bool `json:"ready,omitempty"`
+
+	// Message carries the parent's condition message when not ready.
 	// +optional
 	Message string `json:"message,omitempty"`
 }

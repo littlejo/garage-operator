@@ -1175,6 +1175,7 @@ spec:
     enabled: true
     indexDocument: index.html
   websiteExposure:
+    # hostnames: [my-site.web.garage.example.com]  # default: <globalAlias><rootDomain>
     # exactly one of ingress / gateway
     ingress:
       ingressClassName: traefik
@@ -1185,7 +1186,7 @@ spec:
     #       sectionName: http
 ```
 
-This creates an `Ingress` or `HTTPRoute` (named `<bucket>-website` in the cluster's namespace) that routes `<bucket>.<root-domain>` to the cluster's web API Service. The `WebsiteExposed` condition and `status.websiteExposure` report the result.
+This creates an `Ingress` or `HTTPRoute` (named `<bucket>-website` in the **bucket's** namespace, controller-owned by the bucket) that routes `<bucket>.<root-domain>` — or any hostnames you list — to the cluster's web API Service (`<cluster>-gateway` for unified clusters, or an explicit `websiteExposure.backendRef` override). Ingress exposure only works when the bucket and the cluster share a namespace; an `HTTPRoute` can cross namespaces through a Gateway API `ReferenceGrant` in the cluster's namespace (and needs the operator started with `--enable-gateway-api` plus the Gateway API CRDs). The `WebsiteExposed` condition and `status.websiteExposure` report the result.
 
 Once website hosting is enabled and the bucket has a global alias, the operator populates `status.websiteUrl`:
 

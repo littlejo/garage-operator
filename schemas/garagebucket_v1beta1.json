@@ -265,42 +265,102 @@
           "additionalProperties": false
         },
         "websiteExposure": {
-          "description": "WebsiteExposure optionally exposes a website-enabled bucket through\nKubernetes HTTP routing: an Ingress or a Gateway API HTTPRoute in the\nbucket's namespace, pointing at the cluster's web API Service. At most\none of Ingress and Gateway may be set. See the websiteExposure\ndocumentation for the host semantics (Garage resolves the bucket from\nthe Host header).",
+          "description": "WebsiteExposure optionally exposes a website-enabled bucket through\nKubernetes HTTP routing: an Ingress or a Gateway API HTTPRoute, created\nin this bucket's namespace and pointing at the referenced cluster's web\nAPI Service. At most one of Ingress and Gateway may be set. Requires\nspec.website.enabled. See the websiteExposure documentation for the\nhostname semantics (Garage resolves the bucket from the Host header).",
           "properties": {
+            "backendRef": {
+              "description": "BackendRef overrides the Service the exposure routes to. When unset,\nthe operator targets the referenced cluster's web API Service\n(<cluster>-gateway for unified clusters, <cluster> otherwise). For an\nIngress the referent must be a core/v1 Service in the bucket's\nnamespace (Ingress backends cannot cross namespaces). For an\nHTTPRoute any referent valid for spec.rules[].backendRefs is\naccepted, including cross-namespace ones (which additionally need a\ngateway API ReferenceGrant).",
+              "properties": {
+                "group": {
+                  "description": "Group of the referent. Defaults to \"\" (the core API group).",
+                  "maxLength": 253,
+                  "type": "string"
+                },
+                "kind": {
+                  "description": "Kind of the referent. Defaults to Service.",
+                  "maxLength": 253,
+                  "type": "string"
+                },
+                "name": {
+                  "description": "Name of the referent.",
+                  "maxLength": 253,
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "namespace": {
+                  "description": "Namespace of the referent. Defaults to the bucket's namespace (the\nexposure resource's namespace). For an Ingress it must stay the\nbucket's namespace: Ingress backends cannot cross namespaces.",
+                  "maxLength": 63,
+                  "minLength": 1,
+                  "type": "string"
+                }
+              },
+              "required": [
+                "name"
+              ],
+              "type": "object",
+              "additionalProperties": false
+            },
             "gateway": {
               "description": "Gateway configures the generated Gateway API HTTPRoute. Mutually\nexclusive with Ingress. Requires the Gateway API CRDs to be installed;\nwithout them the operator reports a condition and does not fail the\nbucket.",
               "properties": {
+                "annotations": {
+                  "additionalProperties": {
+                    "type": "string"
+                  },
+                  "description": "Annotations to add to the HTTPRoute.",
+                  "type": "object"
+                },
+                "labels": {
+                  "additionalProperties": {
+                    "type": "string"
+                  },
+                  "description": "Labels to add to the HTTPRoute (for example external-dns or\nargo-rollouts annotations). Operator-managed labels take precedence\non conflict.",
+                  "type": "object"
+                },
                 "parentRefs": {
                   "description": "ParentRefs are passed through verbatim to the HTTPRoute's\nspec.parentRefs (Gateway names, optional sectionName, and optional\ncross-namespace references). At least one is required.",
                   "items": {
-                    "description": "ParentReferenceConfig is a reference to a Gateway (or other accepted\nparent) for a generated HTTPRoute. Field semantics follow the Gateway\nAPI ParentReference: Group defaults to gateway.networking.k8s.io, Kind\ndefaults to Gateway, and Namespace defaults to the HTTPRoute's namespace.",
+                    "description": "ParentReference identifies an API object (usually a Gateway) that can be considered\na parent of this resource (usually a route). There are two kinds of parent resources\nwith \"Core\" support:\n\n* Gateway (Gateway conformance profile)\n* Service (Mesh conformance profile, ClusterIP Services only)\n\nThis API may be extended in the future to support additional kinds of parent\nresources.\n\nThe API object must be valid in the cluster; the Group and Kind must\nbe registered in the cluster for this reference to be valid.",
                     "properties": {
                       "group": {
                         "default": "gateway.networking.k8s.io",
-                        "description": "Group of the referent. Defaults to gateway.networking.k8s.io.",
+                        "description": "Group is the group of the referent.\nWhen unspecified, \"gateway.networking.k8s.io\" is inferred.\nTo set the core API group (such as for a \"Service\" kind referent),\nGroup must be explicitly set to \"\" (empty string).\n\nSupport: Core",
+                        "maxLength": 253,
+                        "pattern": "^$|^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$",
                         "type": "string"
                       },
                       "kind": {
                         "default": "Gateway",
-                        "description": "Kind of the referent. Defaults to Gateway.",
+                        "description": "Kind is kind of the referent.\n\nThere are two kinds of parent resources with \"Core\" support:\n\n* Gateway (Gateway conformance profile)\n* Service (Mesh conformance profile, ClusterIP Services only)\n\nSupport for other resources is Implementation-Specific.",
+                        "maxLength": 63,
+                        "minLength": 1,
+                        "pattern": "^[a-zA-Z]([-a-zA-Z0-9]*[a-zA-Z0-9])?$",
                         "type": "string"
                       },
                       "name": {
-                        "description": "Name of the referent.",
+                        "description": "Name is the name of the referent.\n\nSupport: Core",
                         "maxLength": 253,
                         "minLength": 1,
                         "type": "string"
                       },
                       "namespace": {
-                        "description": "Namespace of the referent. Defaults to the HTTPRoute's namespace.",
+                        "description": "Namespace is the namespace of the referent. When unspecified, this refers\nto the local namespace of the Route.\n\nNote that there are specific rules for ParentRefs which cross namespace\nboundaries. Cross-namespace references are only valid if they are explicitly\nallowed by something in the namespace they are referring to. For example:\nGateway has the AllowedRoutes field, and ReferenceGrant provides a\ngeneric way to enable any other kind of cross-namespace reference.\n\n<gateway:experimental:description>\nParentRefs from a Route to a Service in the same namespace are \"producer\"\nroutes, which apply default routing rules to inbound connections from\nany namespace to the Service.\n\nParentRefs from a Route to a Service in a different namespace are\n\"consumer\" routes, and these routing rules are only applied to outbound\nconnections originating from the same namespace as the Route, for which\nthe intended destination of the connections are a Service targeted as a\nParentRef of the Route.\n</gateway:experimental:description>\n\nSupport: Core",
                         "maxLength": 63,
                         "minLength": 1,
+                        "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$",
                         "type": "string"
                       },
+                      "port": {
+                        "description": "Port is the network port this Route targets. It can be interpreted\ndifferently based on the type of parent resource.\n\nWhen the parent resource is a Gateway, this targets all listeners\nlistening on the specified port that also support this kind of Route(and\nselect this Route). It's not recommended to set `Port` unless the\nnetworking behaviors specified in a Route must apply to a specific port\nas opposed to a listener(s) whose port(s) may be changed. When both Port\nand SectionName are specified, the name and port of the selected listener\nmust match both specified values.\n\n<gateway:experimental:description>\nWhen the parent resource is a Service, this targets a specific port in the\nService spec. When both Port (experimental) and SectionName are specified,\nthe name and port of the selected port must match both specified values.\n</gateway:experimental:description>\n\nImplementations MAY choose to support other parent resources.\nImplementations supporting other types of parent resources MUST clearly\ndocument how/if Port is interpreted.\n\nFor the purpose of status, an attachment is considered successful as\nlong as the parent resource accepts it partially. For example, Gateway\nlisteners can restrict which Routes can attach to them by Route kind,\nnamespace, or hostname. If 1 of 2 Gateway listeners accept attachment\nfrom the referencing Route, the Route MUST be considered successfully\nattached. If no Gateway listeners accept attachment from this Route,\nthe Route MUST be considered detached from the Gateway.\n\nSupport: Extended",
+                        "format": "int32",
+                        "maximum": 65535,
+                        "minimum": 1,
+                        "type": "integer"
+                      },
                       "sectionName": {
-                        "description": "SectionName of the referent (for a Gateway: the listener name).",
+                        "description": "SectionName is the name of a section within the target resource. In the\nfollowing resources, SectionName is interpreted as the following:\n\n* Gateway: Listener name. When both Port (experimental) and SectionName\nare specified, the name and port of the selected listener must match\nboth specified values.\n* Service: Port name. When both Port (experimental) and SectionName\nare specified, the name and port of the selected listener must match\nboth specified values.\n\nImplementations MAY choose to support attaching Routes to other resources.\nIf that is the case, they MUST clearly document how SectionName is\ninterpreted.\n\nWhen unspecified (empty string), this will reference the entire resource.\nFor the purpose of status, an attachment is considered successful if at\nleast one section in the parent resource accepts it. For example, Gateway\nlisteners can restrict which Routes can attach to them by Route kind,\nnamespace, or hostname. If 1 of 2 Gateway listeners accept attachment from\nthe referencing Route, the Route MUST be considered successfully\nattached. If no Gateway listeners accept attachment from this Route, the\nRoute MUST be considered detached from the Gateway.\n\nSupport: Core",
                         "maxLength": 253,
                         "minLength": 1,
+                        "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$",
                         "type": "string"
                       }
                     },
@@ -320,15 +380,16 @@
               "type": "object",
               "additionalProperties": false
             },
-            "host": {
-              "description": "Host is the external hostname the exposure routes on. When empty, it is\nderived as <globalAlias><webApi.rootDomain> \u2014 the only form Garage's\nweb API resolves to this bucket. Required for Gateway; Ingress may omit\nit to use the derived host.",
-              "maxLength": 253,
-              "minLength": 1,
-              "pattern": "^[a-zA-Z0-9]([a-zA-Z0-9\\-\\.]*[a-zA-Z0-9])?$",
-              "type": "string"
+            "hostnames": {
+              "description": "Hostnames are the external hostnames the exposure routes on. When\nempty, the operator uses the single canonical hostname\n<globalAlias><webApi.rootDomain>. Wildcards and duplicates are not\nsupported (duplicates are rejected by the validating webhook; the CRD\nschema cannot express uniqueItems).",
+              "items": {
+                "type": "string"
+              },
+              "maxItems": 16,
+              "type": "array"
             },
             "ingress": {
-              "description": "Ingress configures the generated Kubernetes Ingress. Mutually exclusive\nwith Gateway.",
+              "description": "Ingress configures the generated Kubernetes Ingress. Mutually\nexclusive with Gateway. Only valid when the bucket and the referenced\ncluster share a namespace.",
               "properties": {
                 "annotations": {
                   "additionalProperties": {
@@ -349,16 +410,16 @@
                   },
                   "description": "Labels to add to the Ingress. Operator-managed labels take precedence\non conflict.",
                   "type": "object"
+                },
+                "tlsSecretName": {
+                  "description": "TLSSecretName is the name of a TLS Secret in the bucket's namespace\n(where the generated Ingress lives), attached to the Ingress\n(spec.tls). The Secret must already exist; the operator does not\nprovision certificates.",
+                  "maxLength": 253,
+                  "minLength": 1,
+                  "type": "string"
                 }
               },
               "type": "object",
               "additionalProperties": false
-            },
-            "tlsSecretName": {
-              "description": "TLSSecretName is the name of a TLS Secret in the referenced cluster's\nnamespace (where the generated Ingress lives), attached to the Ingress\n(spec.tls). The Secret must already exist; the operator does not\nprovision certificates. Ignored for Gateway exposure, where TLS is\nconfigured on the Gateway listener.",
-              "maxLength": 253,
-              "minLength": 1,
-              "type": "string"
             }
           },
           "type": "object",
@@ -668,25 +729,47 @@
         "websiteExposure": {
           "description": "WebsiteExposure reports the operator-generated HTTP routing resource\n(Ingress or HTTPRoute) when spec.websiteExposure is set.",
           "properties": {
-            "host": {
-              "description": "Host is the hostname the exposure routes on.",
-              "type": "string"
-            },
-            "message": {
-              "description": "Message carries a human-readable detail, including the reason when\nReady is false (for example a missing Gateway API CRD or an alias not\nyet recorded).",
-              "type": "string"
+            "hostnames": {
+              "description": "Hostnames are the hostnames the generated resource routes on.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
             },
             "name": {
-              "description": "Name is the name of the generated resource.",
+              "description": "Name is the name of the generated resource, in the bucket's namespace.",
               "type": "string"
             },
-            "namespace": {
-              "description": "Namespace is the namespace of the generated resource: the referenced\nGarageCluster's namespace, where the web API Service lives.",
-              "type": "string"
-            },
-            "ready": {
-              "description": "Ready is true when the exposure resource exists and matches the spec.",
-              "type": "boolean"
+            "parents": {
+              "description": "Parents mirrors the route's status.parents for an HTTPRoute: the\nper-parent Accepted/ResolvedRefs/Ready conditions the Gateway\ncontrollers publish. Empty for an Ingress, which has no per-parent\nreadiness model.",
+              "items": {
+                "description": "WebsiteParentStatus is the per-parent readiness of a generated HTTPRoute,\nmirroring gateway.networking.k8s.io/v1 RouteParentStatus conditions.",
+                "properties": {
+                  "accepted": {
+                    "description": "Accepted is true when the parent accepted the route\n(status.parents[].conditions[Accepted]=True).",
+                    "type": "boolean"
+                  },
+                  "message": {
+                    "description": "Message carries the parent's condition message when not ready.",
+                    "type": "string"
+                  },
+                  "parent": {
+                    "description": "Parent is the parent Gateway (or other parent) as namespace/name.",
+                    "type": "string"
+                  },
+                  "ready": {
+                    "description": "Ready is true when the parent reports the route Ready\n(status.parents[].conditions[Ready]=True).",
+                    "type": "boolean"
+                  },
+                  "resolvedRefs": {
+                    "description": "ResolvedRefs is true when the route's backend references resolved on\nthat parent (status.parents[].conditions[ResolvedRefs]=True).",
+                    "type": "boolean"
+                  }
+                },
+                "type": "object",
+                "additionalProperties": false
+              },
+              "type": "array"
             },
             "type": {
               "description": "Type is the kind of routing resource the operator manages for this\nbucket: Ingress or HTTPRoute.",

@@ -234,14 +234,20 @@ func validateGarageBucketSpecWithOptions(obj *GarageBucket, allowUnchangedLegacy
 	return validateLifecycle(obj.Spec.Lifecycle)
 }
 
-// validateWebsiteExposure validates spec.websiteExposure. The host-match
-// check against the cluster's webApi.rootDomain is a controller concern
-// (it needs the referenced GarageCluster); here only the spec-internal
-// invariants are enforced.
+// validateWebsiteExposure validates spec.websiteExposure: spec-internal
+// invariants only (website enabled, ingress/gateway exclusivity,
+// Ingress-same-namespace rule, backendRef referent constraints). The
+// hostname semantics (canonical form, URLRewrite for non-canonical hosts)
+// are a controller concern — they need the referenced GarageCluster's
+// webApi.rootDomain.
 func validateWebsiteExposure(obj *GarageBucket) error {
 	exposure := obj.Spec.WebsiteExposure
 	if exposure == nil {
 		return nil
+	}
+	// An exposure is only meaningful for a website-enabled bucket.
+	if website := obj.Spec.Website; website == nil || website.Enabled == nil || !*website.Enabled {
+		return fmt.Errorf("websiteExposure requires spec.website.enabled: true")
 	}
 	if exposure.Ingress != nil && exposure.Gateway != nil {
 		return fmt.Errorf("websiteExposure.ingress and websiteExposure.gateway are mutually exclusive; set at most one")
@@ -249,14 +255,47 @@ func validateWebsiteExposure(obj *GarageBucket) error {
 	if exposure.Ingress == nil && exposure.Gateway == nil {
 		return fmt.Errorf("websiteExposure requires at least one of websiteExposure.ingress or websiteExposure.gateway")
 	}
+	// An Ingress backend cannot cross namespaces. The exposure resource lives
+	// in the bucket's namespace and routes to the cluster's web Service, so an
+	// Ingress is only valid when the bucket and the cluster share a namespace.
+	// (The HTTPRoute path reaches the cross-namespace backend through a
+	// Gateway API ReferenceGrant, so it is not restricted this way.)
+	clusterNS := obj.Spec.ClusterRef.Namespace
+	if clusterNS == "" {
+		clusterNS = obj.Namespace
+	}
+	if exposure.Ingress != nil && obj.Namespace != clusterNS {
+		return fmt.Errorf("websiteExposure.ingress is not supported when the bucket (%s) and its cluster (%s) are in different namespaces; an Ingress backend cannot cross namespaces. Use websiteExposure.gateway instead", obj.Namespace, clusterNS)
+	}
 	if exposure.Gateway != nil {
-		if exposure.Host == "" {
-			return fmt.Errorf("websiteExposure.host is required when websiteExposure.gateway is set")
-		}
 		for i, ref := range exposure.Gateway.ParentRefs {
 			if ref.Name == "" {
 				return fmt.Errorf("websiteExposure.gateway.parentRefs[%d].name is required", i)
 			}
+		}
+	}
+	// Duplicates are rejected here rather than by the CRD schema: structural
+	// schemas forbid uniqueItems (quadratic runtime complexity).
+	seen := make(map[string]struct{}, len(exposure.Hostnames))
+	for _, host := range exposure.Hostnames {
+		if _, ok := seen[host]; ok {
+			return fmt.Errorf("websiteExposure.hostnames contains the duplicate %q", host)
+		}
+		seen[host] = struct{}{}
+	}
+	if ref := exposure.BackendRef; ref != nil {
+		if ref.Name == "" {
+			return fmt.Errorf("websiteExposure.backendRef.name is required")
+		}
+		kind := ref.Kind
+		if kind == "" {
+			kind = "Service"
+		}
+		if exposure.Ingress != nil && (ref.Group != "" || kind != "Service") {
+			return fmt.Errorf("websiteExposure.backendRef must reference a core/v1 Service for an Ingress (got kind %q group %q)", ref.Kind, ref.Group)
+		}
+		if exposure.Ingress != nil && ref.Namespace != "" && ref.Namespace != obj.Namespace {
+			return fmt.Errorf("websiteExposure.backendRef.namespace %q is invalid for an Ingress: the backend Service must live in the bucket's namespace %q (Ingress backends cannot cross namespaces)", ref.Namespace, obj.Namespace)
 		}
 	}
 	return nil

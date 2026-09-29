@@ -522,34 +522,51 @@ Quotas, Website hosting (index/error docs), Global/Local aliases, Key permission
 
 `spec.websiteExposure` creates an `Ingress` or a Gateway API `HTTPRoute`
 (exactly one of the two) that routes a website-enabled bucket's hostname to
-the cluster's web API Service:
+the cluster's web API Service. Both require `spec.website.enabled: true`
+(enforced by the validating webhook).
 
-- The resource is named `<bucket>-website` and is created **in the cluster's
-  namespace** (Ingress backends cannot cross namespaces; a cross-namespace
-  HTTPRoute backend would additionally need a ReferenceGrant). A controller
-  owner reference is set only when bucket and cluster share a namespace; a
-  cross-namespace resource instead carries the durable ownership label
-  `garage.rajsingh.info/website-exposure-owner=<bucket UID>` and is cleaned
-  up explicitly (finalizer, Retain, and COSI-retain paths), which retain the
-  bucket finalizer until the deletion succeeds so the exposure is never
-  orphaned.
-- Host is `<globalAlias><webApi.rootDomain>` by default; an explicit
-  `spec.websiteExposure.host` must match that exact pattern (Garage resolves
-  the bucket from the Host header, so any other host is a 404). A not-yet
-  recorded alias defers the derived host (`WaitingForAlias`, short requeue).
-- `tlsSecretName` fills the Ingress `spec.tls` section only; ignored for
-  HTTPRoute (TLS lives on the parent Gateway). Backend is the primary
-  `<cluster>` Service, port name `web` (Ingress) / number `getWebPort`
-  (HTTPRoute).
-- Never fails the bucket: outcome is recorded on the `WebsiteExposed`
-  condition + `status.websiteExposure`. Missing Gateway API CRDs →
-  `False/GatewayAPIUnavailable` at the drift requeue (RESTMapper probe, same
-  pattern as `monitoringCRDExists` — no informer when the CRD is absent); a
-  foreign object squatting the generated name is refused, not mutated.
+- The resource is named `<bucket>-website` and is created **in the bucket's
+  namespace**, so it cannot clash across namespaces and always carries a
+  controller owner reference to the bucket (garbage-collected with it).
+  Ingress backends cannot cross namespaces, so **Ingress exposure is only
+  valid when the bucket and the cluster share a namespace** (webhook +
+  controller). **HTTPRoute** exposure works cross-namespace: the route's
+  backend ref points at the cluster's Service in the cluster's namespace and
+  is gated by a Gateway API `ReferenceGrant` in that namespace (owned by the
+  storage admin) — that is the intended Gateway API model, and it keeps a
+  `GarageReferenceGrant` from silently becoming permission to publish routes
+  (with arbitrary annotations) from the storage namespace.
+- `hostnames` (optional list, no wildcards, no duplicates) are the hosts the
+  exposure routes on. When empty the single canonical hostname
+  `<globalAlias><webApi.rootDomain>` is used. Because Garage falls back to
+  the full Host as the alias (`host_to_bucket(host).unwrap_or(host)`), a host
+  equal to the global alias also resolves; for an **HTTPRoute** a host that is
+  neither canonical nor the bare alias gets a `URLRewrite` filter rewriting
+  the Host header to the canonical host. A not-yet-recorded alias defers the
+  derived host (`WaitingForAlias`, short requeue).
+- `tlsSecretName` lives under `websiteExposure.ingress` and fills the Ingress
+  `spec.tls` section only (HTTPRoute TLS is on the parent Gateway). Default
+  backend is `<cluster>-gateway` for unified clusters (gateway tier, where
+  S3/Web terminates), else the primary `<cluster>` Service. `websiteExposure
+  .backendRef` (optional) overrides it — e.g. a cross-namespace `ServiceImport`
+  — with the port taken from `getWebPort`.
+- Never fails the bucket: outcome is on the `WebsiteExposed` condition +
+  `status.websiteExposure` (`hostnames` and, for HTTPRoute, per-parent
+  `Accepted`/`ResolvedRefs`/`Ready`). Readiness for HTTPRoute is derived from
+  the route's own `status.parents` (not "object written"), so the operator
+  watches the owned `Ingress`/`HTTPRoute` back to the bucket.
+- HTTPRoute is only created/watched when the operator is started with
+  `--enable-gateway-api` (or `ENABLE_GATEWAY_API`, like cert-manager) AND the
+  Gateway API CRDs are installed (RESTMapper probe, same pattern as
+  `monitoringCRDExists` — no informer when the CRD is absent). Missing →
+  `False/GatewayAPIUnavailable` at the drift requeue. A foreign object
+  squatting the generated name is refused, not mutated.
 - Reconcile runs after `updateStatusFromGarage` and persists its own status
   changes (that function snapshots the old status for its no-op comparison).
-- RBAC markers in `internal/controller/garagebucket_exposure.go`; chart
-  RBAC mirrors (`clusterrole.yaml`/`namespace-rbac.yaml`) must stay in sync
+- RBAC markers in `internal/controller/garagebucket_exposure.go`; the
+  `gateway.networking.k8s.io/httproutes` chart rules are gated on
+  `.Values.gatewayAPI.enabled` (`clusterrole.yaml`/`namespace-rbac.yaml`) and
+  the generated `config/rbac/role.yaml` stays the superset source of truth
   (checked by the rbac chart-sync tests). `sigs.k8s.io/gateway-api` v1 is
   registered in `cmd/main.go` and the test suites.
 

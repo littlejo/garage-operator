@@ -43,69 +43,92 @@ import (
 // +kubebuilder:rbac:groups=networking.k8s.io,resources=ingresses,verbs=create;delete;get;list;patch;update;watch
 // +kubebuilder:rbac:groups=gateway.networking.k8s.io,resources=httproutes,verbs=create;delete;get;list;patch;update;watch
 
+const (
+	// websiteExposureResourceIngress and websiteExposureResourceHTTPRoute
+	// are the status.websiteExposure.type values.
+	websiteExposureResourceIngress  = "Ingress"
+	websiteExposureResourceHTTPRoute = "HTTPRoute"
+
+	// HTTPRoute route-status condition types (gateway API v1).
+	websiteExposureCondAccepted    = "Accepted"
+	websiteExposureCondResolvedRef = "ResolvedRefs"
+	websiteExposureCondReady       = "Ready"
+
+	// websiteExposureServiceKind is the default backendRef kind.
+	websiteExposureServiceKind = "Service"
+
+	// websiteExposureHTTPRouteKind is the Gateway API kind probed for CRD
+	// availability.
+	websiteExposureHTTPRouteKind = "HTTPRoute"
+)
+
 // websiteExposureResourceName is the name of the operator-generated Ingress
-// or HTTPRoute for a bucket.
+// or HTTPRoute for a bucket. The resource is created in the bucket's own
+// namespace, so the name cannot clash between namespaces.
 func websiteExposureResourceName(bucket *garagev1beta1.GarageBucket) string {
 	return bucket.Name + "-website"
 }
 
-// websiteExposureNamespace is the namespace the exposure resource is created
-// in: the cluster's namespace, where the web API Service lives. Ingress
-// backends cannot cross namespaces, and an HTTPRoute backendRef to the
-// cluster's Service from another namespace would additionally need a
-// gateway ReferenceGrant. A controller owner reference to the bucket is only
-// possible when the bucket and the cluster share a namespace (Kubernetes
-// forbids cross-namespace owner references); in the cross-namespace case the
-// bucket controller deletes the exposure resource explicitly.
-func websiteExposureNamespace(cluster *garagev1beta2.GarageCluster) string {
-	return cluster.Namespace
-}
-
-// websiteExposureBackend returns the Service the exposure routes to: the
-// cluster's in-cluster API Service (the primary <cr> Service, which carries
-// the web port for every cluster shape).
+// websiteExposureBackend returns the Service the exposure routes to when
+// spec.websiteExposure.backendRef is unset: the cluster's gateway-tier
+// Service (<cluster>-gateway) for unified clusters, where the S3/Web traffic
+// terminates, and the primary <cluster> Service otherwise.
 func websiteExposureBackend(cluster *garagev1beta2.GarageCluster) string {
+	if cluster.HasStorageTier() && cluster.HasGatewayTier() {
+		return cluster.Name + "-gateway"
+	}
 	return cluster.Name
-}
-
-// websiteExposureHost resolves the hostname the exposure must route on.
-// Garage resolves the served bucket from the Host header (the bucket's global
-// alias followed by the cluster's webApi.rootDomain), so the only usable host
-// for this bucket is the explicit spec host (which must match that pattern)
-// or the derived <globalAlias><rootDomain> form.
-func websiteExposureHost(cluster *garagev1beta2.GarageCluster, exposure *garagev1beta1.WebsiteExposureConfig, alias string) (string, error) {
-	if exposure.Host != "" {
-		if !websiteExposureHostMatchesAlias(cluster, exposure.Host, alias) {
-			return "", fmt.Errorf(
-				"websiteExposure.host %q does not match the bucket's website host pattern <globalAlias><webApi.rootDomain>: "+
-					"Garage resolves buckets from the Host header, so any other host would be served as a 404",
-				exposure.Host,
-			)
-		}
-		return exposure.Host, nil
-	}
-	if alias == "" {
-		return "", errWebsiteExposureWaitingForAlias
-	}
-	w := effectiveWebAPI(cluster)
-	if w == nil {
-		return "", fmt.Errorf("the referenced cluster has webApi disabled; no website host can be derived")
-	}
-	return alias + w.RootDomain, nil
 }
 
 // errWebsiteExposureWaitingForAlias is the transient host-resolution error
 // while the bucket's global alias is not yet recorded in status.
 var errWebsiteExposureWaitingForAlias = errors.New("waiting for the bucket's global alias to be recorded before the website host can be derived")
 
-// websiteExposureHostMatchesAlias reports whether host is exactly
-// <alias><rootDomain> for the cluster's effective webApi configuration.
-func websiteExposureHostMatchesAlias(cluster *garagev1beta2.GarageCluster, host, alias string) bool {
+// canonicalWebsiteHost derives the canonical website host:
+// <globalAlias><webApi.rootDomain>. Garage's web server strips the rootDomain
+// suffix from the Host header when it matches and uses the remainder as the
+// bucket alias; this form therefore always resolves to the bucket.
+func canonicalWebsiteHost(cluster *garagev1beta2.GarageCluster, alias string) (string, error) {
 	w := effectiveWebAPI(cluster)
-	if w == nil || alias == "" {
+	if w == nil {
+		return "", errors.New("the referenced cluster has webApi disabled; no website host can be derived")
+	}
+	if alias == "" {
+		return "", errWebsiteExposureWaitingForAlias
+	}
+	return alias + w.RootDomain, nil
+}
+
+// websiteExposureHostnames resolves the hostnames the exposure routes on:
+// the spec hostnames when set, otherwise the single canonical hostname.
+//
+// Garage's web server falls back to the full Host as the bucket alias
+// (host_to_bucket(host).unwrap_or(host)), so a hostname equal to the global
+// alias also resolves to the bucket without the rootDomain suffix; the
+// canonical form is still preferred. For an Ingress every requested hostname
+// is simply a rule host. For an HTTPRoute, a hostname that is neither
+// canonical nor the alias gets a URLRewrite filter rewriting the Host header
+// to the canonical host so the request still resolves to the bucket.
+func websiteExposureHostnames(cluster *garagev1beta2.GarageCluster, exposure *garagev1beta1.WebsiteExposureConfig, alias string) ([]string, error) {
+	if len(exposure.Hostnames) > 0 {
+		return exposure.Hostnames, nil
+	}
+	canonical, err := canonicalWebsiteHost(cluster, alias)
+	if err != nil {
+		return nil, err
+	}
+	return []string{canonical}, nil
+}
+
+// websiteExposureNeedsRewrite reports whether an HTTPRoute hostname needs a
+// URLRewrite filter (to the canonical host) so that Garage resolves the
+// request to the bucket: every hostname except the canonical form and the
+// bare alias.
+func websiteExposureNeedsRewrite(host, canonical, alias string) bool {
+	if alias != "" && host == alias {
 		return false
 	}
-	return host == alias+w.RootDomain
+	return host != canonical
 }
 
 // reconcileWebsiteExposure creates, updates, or deletes the Ingress or
@@ -131,123 +154,266 @@ func (r *GarageBucketReconciler) reconcileWebsiteExposure(
 
 	oldStatus := bucket.Status.DeepCopy()
 	exposure := bucket.Spec.WebsiteExposure
+	// The cluster the exposure routes to (where the default web Service
+	// lives), resolved the same way the bucket controller resolves it:
+	// spec.clusterRef.namespace when set, otherwise the bucket's namespace.
+	clusterNamespace := cluster.Namespace
+	if ns := bucket.Spec.ClusterRef.Namespace; ns != "" {
+		clusterNamespace = ns
+	}
 	if exposure == nil {
-		if err := r.deleteWebsiteExposureResource(ctx, bucket, websiteExposureNamespace(cluster)); err != nil {
+		if err := r.deleteWebsiteExposureResource(ctx, bucket); err != nil {
 			return ctrl.Result{}, err
 		}
-		if err := r.persistWebsiteExposureStatus(ctx, bucket, oldStatus, nil); err != nil {
+		if err := r.persistWebsiteExposureStatus(ctx, bucket, oldStatus, nil, nil); err != nil {
 			return ctrl.Result{}, err
 		}
 		return ctrl.Result{}, nil
 	}
 
 	alias := bucket.Status.GlobalAlias
-	host, hostErr := websiteExposureHost(cluster, exposure, alias)
-	if hostErr != nil {
-		if errors.Is(hostErr, errWebsiteExposureWaitingForAlias) && exposure.Host == "" {
-			condition := metav1.Condition{
-				Type:               garagev1beta1.ConditionWebsiteExposed,
-				Status:             metav1.ConditionFalse,
-				Reason:             "WaitingForAlias",
-				Message:            "the bucket's global alias is not recorded yet; the derived website host cannot be computed",
-				ObservedGeneration: bucket.Generation,
-			}
-			status := &garagev1beta1.WebsiteExposureStatus{
-				Name:    websiteExposureResourceName(bucket),
-				Ready:   false,
-				Message: condition.Message,
-			}
-			if err := r.persistWebsiteExposureStatus(ctx, bucket, oldStatus, status, condition); err != nil {
-				return ctrl.Result{}, err
-			}
-			return ctrl.Result{RequeueAfter: RequeueAfterShort}, nil
+
+	// Ingress and HTTPRoute share the generated name, so exactly one may
+	// exist: when the spec switches kinds (or names neither, handled above),
+	// the previously generated resource of the other kind is removed.
+	if exposure.Gateway != nil {
+		if err := r.deleteWebsiteExposureIngress(ctx, bucket); err != nil {
+			return ctrl.Result{}, err
 		}
-		return r.finishWebsiteExposure(ctx, bucket, cluster, oldStatus, "", hostErr)
+	} else {
+		if err := r.deleteWebsiteExposureRoute(ctx, bucket); err != nil {
+			return ctrl.Result{}, err
+		}
 	}
 
-	var (
-		resource client.Object
-		kind     string
-		err      error
-	)
+	// WaitingForAlias is reported when the canonical host cannot be derived:
+	// either the hostnames are not explicit, or (HTTPRoute only) a non-
+	// canonical explicit hostname needs a rewrite target that the alias
+	// would provide.
+	waitingForAlias := func(err error) (ctrl.Result, bool) {
+		if !errors.Is(err, errWebsiteExposureWaitingForAlias) {
+			return ctrl.Result{}, false
+		}
+		condition := &metav1.Condition{
+			Type:               garagev1beta1.ConditionWebsiteExposed,
+			Status:             metav1.ConditionFalse,
+			Reason:             "WaitingForAlias",
+			Message:            "the bucket's global alias is not recorded yet; the derived website host cannot be computed",
+			ObservedGeneration: bucket.Generation,
+		}
+		status := &garagev1beta1.WebsiteExposureStatus{Name: websiteExposureResourceName(bucket)}
+		if exposure.Gateway != nil {
+			status.Type = websiteExposureResourceHTTPRoute
+		} else {
+			status.Type = websiteExposureResourceIngress
+		}
+		if err := r.persistWebsiteExposureStatus(ctx, bucket, oldStatus, status, condition); err != nil {
+			return ctrl.Result{}, true
+		}
+		return ctrl.Result{RequeueAfter: RequeueAfterShort}, true
+	}
+
+	if len(exposure.Hostnames) == 0 {
+		// Only the derived host needs the alias; explicit hostnames work
+		// before the alias is recorded.
+		if _, err := canonicalWebsiteHost(cluster, alias); err != nil {
+			if result, done := waitingForAlias(err); done {
+				return result, nil
+			}
+			return r.finishWebsiteExposure(ctx, bucket, cluster, oldStatus, nil, err, "ReconcileFailed", err.Error())
+		}
+	}
+
 	if exposure.Gateway != nil {
-		kind = "HTTPRoute"
-		if !r.gatewayAPIAvailable() {
-			condition := metav1.Condition{
+		if !r.gatewayAPIEnabled() {
+			condition := &metav1.Condition{
 				Type:               garagev1beta1.ConditionWebsiteExposed,
 				Status:             metav1.ConditionFalse,
 				Reason:             "GatewayAPIUnavailable",
-				Message:            "spec.websiteExposure.gateway is set but the gateway.networking.k8s.io HTTPRoute CRD is not installed; install the Gateway API CRDs to enable it",
+				Message:            "spec.websiteExposure.gateway is set but the Gateway API is unavailable (CRDs not installed or the operator is not started with --enable-gateway-api)",
 				ObservedGeneration: bucket.Generation,
 			}
 			status := &garagev1beta1.WebsiteExposureStatus{
-				Type:    kind,
-				Name:    websiteExposureResourceName(bucket),
-				Host:    host,
-				Ready:   false,
-				Message: condition.Message,
+				Type: "HTTPRoute",
+				Name: websiteExposureResourceName(bucket),
 			}
 			if err := r.persistWebsiteExposureStatus(ctx, bucket, oldStatus, status, condition); err != nil {
 				return ctrl.Result{}, err
 			}
 			return ctrl.Result{RequeueAfter: RequeueAfterDrift}, nil
 		}
-		resource, err = r.buildHTTPRoute(bucket, cluster, exposure, host)
-	} else {
-		kind = "Ingress"
-		resource, err = r.buildIngress(bucket, cluster, exposure, host)
-	}
-	if err != nil {
-		return r.finishWebsiteExposure(ctx, bucket, cluster, oldStatus, host, err)
+		route, err := r.buildHTTPRoute(bucket, clusterNamespace, cluster, exposure)
+		if err != nil {
+			if result, done := waitingForAlias(err); done {
+				return result, nil
+			}
+			return r.finishWebsiteExposure(ctx, bucket, cluster, oldStatus, nil, err, "ReconcileFailed", err.Error())
+		}
+		if err := r.applyWebsiteExposureResource(ctx, bucket, route); err != nil {
+			return r.finishWebsiteExposure(ctx, bucket, cluster, oldStatus, nil, err, "ReconcileFailed", err.Error())
+		}
+		fresh := &gatewayv1.HTTPRoute{}
+		if err := r.Get(ctx, types.NamespacedName{Name: route.Name, Namespace: route.Namespace}, fresh); err != nil {
+			return r.finishWebsiteExposure(ctx, bucket, cluster, oldStatus, nil, err, "ReconcileFailed", err.Error())
+		}
+		ready, message := websiteExposureRouteReady(fresh)
+		status := websiteExposureStatusFromRoute(fresh)
+		if ready {
+			return r.finishWebsiteExposure(ctx, bucket, cluster, oldStatus, status, nil, "Exposed",
+				fmt.Sprintf("website exposed via HTTPRoute %s/%s", fresh.Namespace, fresh.Name))
+		}
+		result, err := r.finishWebsiteExposure(ctx, bucket, cluster, oldStatus, status, nil, "NotReady", message)
+		if err != nil {
+			return result, err
+		}
+		if result.RequeueAfter == 0 {
+			result.RequeueAfter = RequeueAfterShort
+		}
+		return result, nil
 	}
 
-	if err := r.applyWebsiteExposureResource(ctx, bucket, cluster, resource); err != nil {
-		return r.finishWebsiteExposure(ctx, bucket, cluster, oldStatus, host, err)
+	ingress, err := r.buildIngress(bucket, clusterNamespace, cluster, exposure)
+	if err != nil {
+		return r.finishWebsiteExposure(ctx, bucket, cluster, oldStatus, nil, err, "ReconcileFailed", err.Error())
 	}
-	return r.finishWebsiteExposure(ctx, bucket, cluster, oldStatus, host, nil, kind)
+	if err := r.applyWebsiteExposureResource(ctx, bucket, ingress); err != nil {
+		return r.finishWebsiteExposure(ctx, bucket, cluster, oldStatus, nil, err, "ReconcileFailed", err.Error())
+	}
+	fresh := &networkingv1.Ingress{}
+	if err := r.Get(ctx, types.NamespacedName{Name: ingress.Name, Namespace: ingress.Namespace}, fresh); err != nil {
+		return r.finishWebsiteExposure(ctx, bucket, cluster, oldStatus, nil, err, "ReconcileFailed", err.Error())
+	}
+	return r.finishWebsiteExposure(ctx, bucket, cluster, oldStatus, websiteExposureStatusFromIngress(fresh), nil,
+		"Exposed", fmt.Sprintf("website exposed via Ingress %s/%s", fresh.Namespace, fresh.Name))
 }
 
-// finishWebsiteExposure sets the WebsiteExposed condition, mirrors the
-// outcome on status.websiteExposure, and persists it when changed. host is
-// the resolved website host (empty when it could not be resolved); kind is
-// the resource type on success.
+// websiteExposureStatusFromRoute summarizes the generated HTTPRoute for
+// status.websiteExposure: kind, name, the hostnames it routes on, and the
+// per-parent readiness reported by the route's own status.
+func websiteExposureStatusFromRoute(route *gatewayv1.HTTPRoute) *garagev1beta1.WebsiteExposureStatus {
+	hostnames := make([]string, 0, len(route.Spec.Hostnames))
+	for _, h := range route.Spec.Hostnames {
+		hostnames = append(hostnames, string(h))
+	}
+	status := &garagev1beta1.WebsiteExposureStatus{
+		Type:      "HTTPRoute",
+		Name:      route.Name,
+		Hostnames: hostnames,
+	}
+	for _, parent := range route.Status.Parents {
+		parentStatus := garagev1beta1.WebsiteParentStatus{
+			Parent: websiteExposureParentName(parent),
+		}
+		for _, cond := range parent.Conditions {
+			switch cond.Type {
+			case "Accepted":
+				parentStatus.Accepted = cond.Status == metav1.ConditionTrue
+			case "ResolvedRefs":
+				parentStatus.ResolvedRefs = cond.Status == metav1.ConditionTrue
+			case "Ready":
+				parentStatus.Ready = cond.Status == metav1.ConditionTrue
+				if cond.Status != metav1.ConditionTrue && cond.Message != "" {
+					parentStatus.Message = cond.Message
+				}
+			}
+		}
+		status.Parents = append(status.Parents, parentStatus)
+	}
+	return status
+}
+
+// websiteExposureStatusFromIngress summarizes the generated Ingress for
+// status.websiteExposure. Ingress has no per-parent readiness model, so only
+// kind and hostnames are reported; readiness lives on the condition.
+func websiteExposureStatusFromIngress(ingress *networkingv1.Ingress) *garagev1beta1.WebsiteExposureStatus {
+	hostnames := make([]string, 0, len(ingress.Spec.Rules))
+	for _, rule := range ingress.Spec.Rules {
+		if rule.Host != "" {
+			hostnames = append(hostnames, rule.Host)
+		}
+	}
+	return &garagev1beta1.WebsiteExposureStatus{
+		Type:      "Ingress",
+		Name:      ingress.Name,
+		Hostnames: hostnames,
+	}
+}
+
+// websiteExposureRouteReady derives the exposure readiness from the route's
+// status.parents (Accepted / ResolvedRefs / Ready) rather than from the fact
+// that the operator wrote the object: a route whose parent Gateway does not
+// accept it, or whose backend reference cannot be resolved (missing
+// ReferenceGrant, unknown Service), is not ready.
+func websiteExposureRouteReady(route *gatewayv1.HTTPRoute) (ready bool, message string) {
+	if len(route.Status.Parents) == 0 {
+		return false, "the route has no parent status yet; the Gateway controller has not processed it"
+	}
+	for _, parent := range route.Status.Parents {
+		name := websiteExposureParentName(parent)
+		accepted := websiteExposureParentCond(parent, "Accepted")
+		if accepted == nil {
+			return false, "the parent " + name + " has not reported an Accepted condition yet"
+		}
+		if accepted.Status != metav1.ConditionTrue {
+			return false, "the parent " + name + " does not accept the route: " + accepted.Message
+		}
+		if resolved := websiteExposureParentCond(parent, "ResolvedRefs"); resolved != nil && resolved.Status != metav1.ConditionTrue {
+			return false, "the route's backend reference is not resolved on " + name + ": " + resolved.Message
+		}
+		if readyParent := websiteExposureParentCond(parent, "Ready"); readyParent != nil && readyParent.Status != metav1.ConditionTrue {
+			return false, "the route is not ready on " + name + ": " + readyParent.Message
+		}
+	}
+	return true, "route accepted and its backend reference resolved"
+}
+
+func websiteExposureParentName(parent gatewayv1.RouteParentStatus) string {
+	ref := parent.ParentRef
+	if ref.Namespace == nil {
+		return string(ref.Name)
+	}
+	return string(*ref.Namespace) + "/" + string(ref.Name)
+}
+
+func websiteExposureParentCond(parent gatewayv1.RouteParentStatus, condType string) *metav1.Condition {
+	for i := range parent.Conditions {
+		if parent.Conditions[i].Type == condType {
+			return &parent.Conditions[i]
+		}
+	}
+	return nil
+}
+
+// finishWebsiteExposure sets the WebsiteExposed condition and mirrors the
+// outcome on status.websiteExposure, persisting when changed. status carries
+// the observed routing resource (nil when the exposure is removed); err is
+// non-nil only for a reconcile error (the condition then takes the
+// ReconcileFailed reason), while non-ready-but-expected states are passed as
+// reason/message with err nil.
 func (r *GarageBucketReconciler) finishWebsiteExposure(
 	ctx context.Context,
 	bucket *garagev1beta1.GarageBucket,
 	cluster *garagev1beta2.GarageCluster,
 	oldStatus *garagev1beta1.GarageBucketStatus,
-	host string,
+	status *garagev1beta1.WebsiteExposureStatus,
 	err error,
-	kind ...string,
+	reason string,
+	message string,
 ) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
-	name := websiteExposureResourceName(bucket)
-	status := &garagev1beta1.WebsiteExposureStatus{Name: name, Namespace: websiteExposureNamespace(cluster), Host: host}
-	condition := metav1.Condition{}
+	condition := metav1.Condition{
+		Type:               garagev1beta1.ConditionWebsiteExposed,
+		Status:             metav1.ConditionFalse,
+		Reason:             reason,
+		Message:            message,
+		ObservedGeneration: bucket.Generation,
+	}
 	if err != nil {
 		log.V(1).Info("Website exposure reconcile failed", "bucket", bucket.Name, "error", err.Error())
-		status.Ready = false
-		status.Message = err.Error()
-		condition = metav1.Condition{
-			Type:               garagev1beta1.ConditionWebsiteExposed,
-			Status:             metav1.ConditionFalse,
-			Reason:             garagev1beta1.ReasonReconcileFailed,
-			Message:            err.Error(),
-			ObservedGeneration: bucket.Generation,
-		}
-	} else if len(kind) == 1 && kind[0] != "" {
-		status.Type = kind[0]
-		status.Ready = true
-		status.Message = "website exposed via " + kind[0] + " " + status.Namespace + "/" + name
-		condition = metav1.Condition{
-			Type:               garagev1beta1.ConditionWebsiteExposed,
-			Status:             metav1.ConditionTrue,
-			Reason:             "Exposed",
-			Message:            status.Message,
-			ObservedGeneration: bucket.Generation,
-		}
+	} else if reason == "Exposed" {
+		condition.Status = metav1.ConditionTrue
 	}
-	if err := r.persistWebsiteExposureStatus(ctx, bucket, oldStatus, status, condition); err != nil {
+	if err := r.persistWebsiteExposureStatus(ctx, bucket, oldStatus, status, &condition); err != nil {
 		return ctrl.Result{}, err
 	}
 	if err == nil {
@@ -255,7 +421,7 @@ func (r *GarageBucketReconciler) finishWebsiteExposure(
 	}
 	// A foreign object squatting the generated name, or a missing RBAC grant,
 	// will not heal by fast retry; back off to the drift interval.
-	if strings.Contains(err.Error(), "not owned by") || k8errors.IsForbidden(err) {
+	if strings.Contains(message, "not owned by") || k8errors.IsForbidden(err) {
 		return ctrl.Result{RequeueAfter: RequeueAfterDrift}, nil
 	}
 	return ctrl.Result{RequeueAfter: RequeueAfterError}, nil
@@ -264,16 +430,17 @@ func (r *GarageBucketReconciler) finishWebsiteExposure(
 // persistWebsiteExposureStatus writes the WebsiteExposed condition and the
 // status.websiteExposure block, skipping the status write when nothing
 // changed (the informer-driven no-op avoidance pattern used by
-// updateStatusFromGarage). status is nil when the exposure spec is gone and
-// both are cleared.
+// updateStatusFromGarage). status is nil when the exposure spec is gone (both
+// are cleared) or could not be observed (only the condition is written, the
+// previously recorded status is kept).
 func (r *GarageBucketReconciler) persistWebsiteExposureStatus(
 	ctx context.Context,
 	bucket *garagev1beta1.GarageBucket,
 	oldStatus *garagev1beta1.GarageBucketStatus,
 	status *garagev1beta1.WebsiteExposureStatus,
-	condition ...metav1.Condition,
+	condition *metav1.Condition,
 ) error {
-	if status == nil {
+	if status == nil && condition == nil {
 		bucket.Status.WebsiteExposure = nil
 		conditions := make([]metav1.Condition, 0, len(bucket.Status.Conditions))
 		for _, c := range bucket.Status.Conditions {
@@ -284,9 +451,11 @@ func (r *GarageBucketReconciler) persistWebsiteExposureStatus(
 		}
 		bucket.Status.Conditions = conditions
 	} else {
-		bucket.Status.WebsiteExposure = status
-		if len(condition) == 1 {
-			meta.SetStatusCondition(&bucket.Status.Conditions, condition[0])
+		if status != nil {
+			bucket.Status.WebsiteExposure = status
+		}
+		if condition != nil {
+			meta.SetStatusCondition(&bucket.Status.Conditions, *condition)
 		}
 	}
 	if apiequality.Semantic.DeepEqual(*oldStatus, bucket.Status) {
@@ -296,57 +465,122 @@ func (r *GarageBucketReconciler) persistWebsiteExposureStatus(
 }
 
 // websiteExposureBaseLabels returns the operator-set labels for a generated
-// exposure resource. In the cross-namespace case (where no controller owner
-// reference can be set) the bucket's UID is recorded as a durable ownership
-// marker so later reconciles and deletions can recognize the operator's own
-// object.
-func websiteExposureBaseLabels(bucket *garagev1beta1.GarageBucket, cluster *garagev1beta2.GarageCluster) map[string]string {
-	labels := map[string]string{
+// exposure resource.
+func websiteExposureBaseLabels(bucket *garagev1beta1.GarageBucket) map[string]string {
+	return map[string]string{
 		labelAppManagedBy: "garage-operator",
 		labelBucketRef:    bucket.Name,
 	}
-	if bucket.Namespace != cluster.Namespace {
-		labels[labelWebsiteExposureOwner] = string(bucket.UID)
-	}
-	return labels
 }
 
-// isWebsiteExposureOwned reports whether an existing exposure resource is
-// owned by the bucket: by controller owner reference (same-namespace) or by
-// the durable UID label (cross-namespace, where no owner reference can be
-// set).
-func isWebsiteExposureOwned(obj client.Object, bucket *garagev1beta1.GarageBucket, cluster *garagev1beta2.GarageCluster) bool {
-	if metav1.IsControlledBy(obj, bucket) {
-		return true
+// websiteExposureBackendRef builds the backend reference for the exposure's
+// routing rule: the explicit spec.websiteExposure.backendRef override, or
+// the cluster's web API Service (gateway tier for unified clusters). The
+// port is always the cluster's effective web API port number. The
+// namespace of the default backend is the cluster's (where the Service
+// lives); an explicit referent says where it lives itself.
+func websiteExposureBackendRef(
+	bucket *garagev1beta1.GarageBucket,
+	clusterNamespace string,
+	cluster *garagev1beta2.GarageCluster,
+	ref *garagev1beta1.WebsiteExposureBackendReference,
+) gatewayv1.BackendObjectReference {
+	group := ""
+	kind := "Service"
+	namespace := ""
+	name := websiteExposureBackend(cluster)
+	if ref != nil {
+		group = ref.Group
+		if ref.Kind != "" {
+			kind = ref.Kind
+		}
+		namespace = ref.Namespace
+		name = ref.Name
+	} else {
+		namespace = clusterNamespace
 	}
-	if bucket.Namespace == cluster.Namespace {
-		return false
+	port := getWebPort(cluster)
+	portNumber := gatewayv1.PortNumber(port)
+	backref := gatewayv1.BackendObjectReference{
+		Name: gatewayv1.ObjectName(name),
+		Port: &portNumber,
 	}
-	return obj.GetLabels()[labelWebsiteExposureOwner] == string(bucket.UID)
+	if group != "" {
+		g := gatewayv1.Group(group)
+		backref.Group = &g
+	}
+	if kind != "Service" {
+		k := gatewayv1.Kind(kind)
+		backref.Kind = &k
+	}
+	// The exposure lives in the bucket's namespace; an omitted namespace
+	// means "same namespace" in Gateway API semantics. Set it explicitly only
+	// when the referent genuinely lives elsewhere (a cross-namespace backend
+	// then needs the gateway ReferenceGrant the storage admin owns).
+	if namespace != "" && namespace != bucket.Namespace {
+		ns := gatewayv1.Namespace(namespace)
+		backref.Namespace = &ns
+	}
+	return backref
+}
+
+// ingressBackendName resolves the Service name for the Ingress backend
+// (Ingress backends are core/v1 Services in the Ingress's namespace, which
+// is the bucket's namespace).
+func ingressBackendName(bucket *garagev1beta1.GarageBucket, cluster *garagev1beta2.GarageCluster, ref *garagev1beta1.WebsiteExposureBackendReference) (string, error) {
+	if ref == nil {
+		return websiteExposureBackend(cluster), nil
+	}
+	if ref.Group != "" || (ref.Kind != "" && ref.Kind != "Service") {
+		return "", fmt.Errorf("websiteExposure.backendRef must reference a core/v1 Service for an Ingress (got kind %q group %q)", ref.Kind, ref.Group)
+	}
+	if ref.Namespace != "" && ref.Namespace != bucket.Namespace {
+		return "", fmt.Errorf("websiteExposure.backendRef.namespace %q is invalid for an Ingress: the backend Service must live in the bucket's namespace %q (Ingress backends cannot cross namespaces)", ref.Namespace, bucket.Namespace)
+	}
+	return ref.Name, nil
 }
 
 // buildIngress constructs the desired Ingress for a website-enabled bucket.
+// The Ingress is created in the bucket's namespace; its backend Service must
+// therefore be in that namespace too.
 func (r *GarageBucketReconciler) buildIngress(
 	bucket *garagev1beta1.GarageBucket,
+	clusterNamespace string,
 	cluster *garagev1beta2.GarageCluster,
 	exposure *garagev1beta1.WebsiteExposureConfig,
-	host string,
 ) (*networkingv1.Ingress, error) {
 	ingressConfig := exposure.Ingress
 	if ingressConfig == nil {
 		return nil, fmt.Errorf("websiteExposure.ingress is required")
 	}
-	svcName := websiteExposureBackend(cluster)
-
-	labels := mergeLabels(websiteExposureBaseLabels(bucket, cluster), ingressConfig.Labels)
+	// Defensive mirror of the validating webhook (which catches this at
+	// admission): an Ingress backend cannot cross namespaces, and the
+	// exposure Ingress routes to the cluster's web Service — so Ingress
+	// exposure is only valid when the bucket and the cluster share a
+	// namespace. Cross-namespace exposure is the HTTPRoute path, which
+	// reaches the cluster's Service through a gateway ReferenceGrant.
+	if clusterNamespace == "" {
+		clusterNamespace = bucket.Namespace
+	}
+	if bucket.Namespace != clusterNamespace {
+		return nil, fmt.Errorf("websiteExposure.ingress is not supported when the bucket (%s) and its cluster (%s) are in different namespaces: an Ingress backend cannot cross namespaces. Use websiteExposure.gateway instead", bucket.Namespace, clusterNamespace)
+	}
+	svcName, err := ingressBackendName(bucket, cluster, exposure.BackendRef)
+	if err != nil {
+		return nil, err
+	}
+	hostnames, err := websiteExposureHostnames(cluster, exposure, bucket.Status.GlobalAlias)
+	if err != nil {
+		return nil, err
+	}
 
 	pathType := networkingv1.PathTypePrefix
 	var tls []networkingv1.IngressTLS
-	if exposure.TLSSecretName != "" {
+	if ingressConfig.TLSSecretName != "" {
 		tls = []networkingv1.IngressTLS{
 			{
-				Hosts:      []string{host},
-				SecretName: exposure.TLSSecretName,
+				Hosts:      hostnames,
+				SecretName: ingressConfig.TLSSecretName,
 			},
 		}
 	}
@@ -355,32 +589,21 @@ func (r *GarageBucketReconciler) buildIngress(
 		className = &ingressConfig.IngressClassName
 	}
 
-	return &networkingv1.Ingress{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:        websiteExposureResourceName(bucket),
-			Namespace:   websiteExposureNamespace(cluster),
-			Labels:      labels,
-			Annotations: copyStringMap(ingressConfig.Annotations),
-		},
-		Spec: networkingv1.IngressSpec{
-			IngressClassName: className,
-			TLS:              tls,
-			Rules: []networkingv1.IngressRule{
-				{
-					Host: host,
-					IngressRuleValue: networkingv1.IngressRuleValue{
-						HTTP: &networkingv1.HTTPIngressRuleValue{
-							Paths: []networkingv1.HTTPIngressPath{
-								{
-									Path:     "/",
-									PathType: &pathType,
-									Backend: networkingv1.IngressBackend{
-										Service: &networkingv1.IngressServiceBackend{
-											Name: svcName,
-											Port: networkingv1.ServiceBackendPort{
-												Name: webPortName,
-											},
-										},
+	rules := make([]networkingv1.IngressRule, 0, len(hostnames))
+	for _, host := range hostnames {
+		rules = append(rules, networkingv1.IngressRule{
+			Host: host,
+			IngressRuleValue: networkingv1.IngressRuleValue{
+				HTTP: &networkingv1.HTTPIngressRuleValue{
+					Paths: []networkingv1.HTTPIngressPath{
+						{
+							Path:     "/",
+							PathType: &pathType,
+							Backend: networkingv1.IngressBackend{
+								Service: &networkingv1.IngressServiceBackend{
+									Name: svcName,
+									Port: networkingv1.ServiceBackendPort{
+										Name: webPortName,
 									},
 								},
 							},
@@ -388,110 +611,143 @@ func (r *GarageBucketReconciler) buildIngress(
 					},
 				},
 			},
+		})
+	}
+
+	return &networkingv1.Ingress{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        websiteExposureResourceName(bucket),
+			Namespace:   bucket.Namespace,
+			Labels:      mergeLabels(websiteExposureBaseLabels(bucket), ingressConfig.Labels),
+			Annotations: copyStringMap(ingressConfig.Annotations),
+		},
+		Spec: networkingv1.IngressSpec{
+			IngressClassName: className,
+			TLS:              tls,
+			Rules:            rules,
 		},
 	}, nil
 }
 
 // buildHTTPRoute constructs the desired Gateway API HTTPRoute for a
-// website-enabled bucket.
+// website-enabled bucket. The route is created in the bucket's namespace; a
+// backend in another namespace (the cluster's web Service, or an explicit
+// cross-namespace backendRef) requires a gateway API ReferenceGrant in the
+// backend's namespace.
 func (r *GarageBucketReconciler) buildHTTPRoute(
 	bucket *garagev1beta1.GarageBucket,
+	clusterNamespace string,
 	cluster *garagev1beta2.GarageCluster,
 	exposure *garagev1beta1.WebsiteExposureConfig,
-	host string,
 ) (*gatewayv1.HTTPRoute, error) {
 	gatewayConfig := exposure.Gateway
 	if gatewayConfig == nil {
 		return nil, fmt.Errorf("websiteExposure.gateway is required")
 	}
-	svcName := websiteExposureBackend(cluster)
+	canonical, err := canonicalWebsiteHost(cluster, bucket.Status.GlobalAlias)
+	if err != nil {
+		return nil, err
+	}
+	hostnames, err := websiteExposureHostnames(cluster, exposure, bucket.Status.GlobalAlias)
+	if err != nil {
+		return nil, err
+	}
+	backendRef := websiteExposureBackendRef(bucket, clusterNamespace, cluster, exposure.BackendRef)
 
-	parentRefs := make([]gatewayv1.ParentReference, 0, len(gatewayConfig.ParentRefs))
-	for _, ref := range gatewayConfig.ParentRefs {
-		ga := gatewayv1.ParentReference{Name: gatewayv1.ObjectName(ref.Name)}
-		if ref.Group != "" {
-			group := gatewayv1.Group(ref.Group)
-			ga.Group = &group
+	// spec.parentRefs is embedded upstream gatewayv1 types verbatim; copy so
+	// the operator never mutates the spec object it was handed. A parentRef
+	// with no namespace defaults to the route's namespace in Gateway API
+	// semantics; record it explicitly so the intent is visible on the stored
+	// object.
+	parentRefs := make([]gatewayv1.ParentReference, len(gatewayConfig.ParentRefs))
+	copy(parentRefs, gatewayConfig.ParentRefs)
+	for i := range parentRefs {
+		if parentRefs[i].Namespace == nil {
+			ns := gatewayv1.Namespace(bucket.Namespace)
+			parentRefs[i].Namespace = &ns
 		}
-		if ref.Kind != "" {
-			kind := gatewayv1.Kind(ref.Kind)
-			ga.Kind = &kind
-		}
-		if ref.Namespace != "" {
-			ns := gatewayv1.Namespace(ref.Namespace)
-			ga.Namespace = &ns
-		}
-		if ref.SectionName != "" {
-			section := gatewayv1.SectionName(ref.SectionName)
-			ga.SectionName = &section
-		}
-		parentRefs = append(parentRefs, ga)
 	}
 
 	pathPrefix := gatewayv1.PathMatchPathPrefix
 	pathValue := "/"
-	port := getWebPort(cluster)
+	canonicalHostname := gatewayv1.PreciseHostname(canonical)
+	rules := make([]gatewayv1.HTTPRouteRule, 0, len(hostnames))
+	for _, host := range hostnames {
+		var filters []gatewayv1.HTTPRouteFilter
+		if websiteExposureNeedsRewrite(host, canonical, bucket.Status.GlobalAlias) {
+			// The hostname is neither the canonical <alias><rootDomain> form
+			// nor the bare alias: rewrite the Host header so Garage resolves
+			// the request to this bucket.
+			filters = append(filters, gatewayv1.HTTPRouteFilter{
+				Type: gatewayv1.HTTPRouteFilterURLRewrite,
+				URLRewrite: &gatewayv1.HTTPURLRewriteFilter{
+					Hostname: &canonicalHostname,
+				},
+			})
+		}
+		rules = append(rules, gatewayv1.HTTPRouteRule{
+			Matches: []gatewayv1.HTTPRouteMatch{
+				{
+					Path: &gatewayv1.HTTPPathMatch{
+						Type:  &pathPrefix,
+						Value: &pathValue,
+					},
+				},
+			},
+			Filters: filters,
+			BackendRefs: []gatewayv1.HTTPBackendRef{
+				{
+					BackendRef: gatewayv1.BackendRef{
+						BackendObjectReference: backendRef,
+					},
+				},
+			},
+		})
+	}
 
-	return &gatewayv1.HTTPRoute{
+	route := &gatewayv1.HTTPRoute{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      websiteExposureResourceName(bucket),
-			Namespace: websiteExposureNamespace(cluster),
-			Labels:    websiteExposureBaseLabels(bucket, cluster),
+			Namespace: bucket.Namespace,
+			Labels:    mergeLabels(websiteExposureBaseLabels(bucket), gatewayConfig.Labels),
 		},
 		Spec: gatewayv1.HTTPRouteSpec{
 			CommonRouteSpec: gatewayv1.CommonRouteSpec{
 				ParentRefs: parentRefs,
 			},
-			Hostnames: []gatewayv1.Hostname{gatewayv1.Hostname(host)},
-			Rules: []gatewayv1.HTTPRouteRule{
-				{
-					Matches: []gatewayv1.HTTPRouteMatch{
-						{
-							Path: &gatewayv1.HTTPPathMatch{
-								Type:  &pathPrefix,
-								Value: &pathValue,
-							},
-						},
-					},
-					BackendRefs: []gatewayv1.HTTPBackendRef{
-						{
-							BackendRef: gatewayv1.BackendRef{
-								BackendObjectReference: gatewayv1.BackendObjectReference{
-									Name: gatewayv1.ObjectName(svcName),
-									// The route is created in the cluster's own
-									// namespace, so the Service backend is
-									// same-namespace and no ReferenceGrant is
-									// needed.
-									Port: &port,
-								},
-							},
-						},
-					},
-				},
-			},
+			Hostnames: make([]gatewayv1.Hostname, len(hostnames)),
+			Rules:     rules,
 		},
-	}, nil
+	}
+	for i, h := range hostnames {
+		route.Spec.Hostnames[i] = gatewayv1.Hostname(h)
+	}
+	if len(gatewayConfig.Annotations) > 0 {
+		route.Annotations = copyStringMap(gatewayConfig.Annotations)
+	}
+	return route, nil
 }
 
 // applyWebsiteExposureResource creates or updates the desired exposure
-// resource. The controller owner reference is only set when bucket and
-// cluster share a namespace (Kubernetes forbids cross-namespace owner
-// references); cross-namespace objects carry the durable
-// labelWebsiteExposureOwner UID marker instead. Ownership is enforced by
-// exact UID, mirroring reconcileService: a foreign object squatting on the
-// generated name is never mutated.
+// resource. The exposure lives in the bucket's own namespace, so a
+// controller owner reference is always set: garbage collection removes the
+// resource with the bucket, and later reconciles recognize the operator's
+// object through the owner reference alone. An object not owned by this
+// bucket squatting on the generated name is refused, not mutated.
+//
+// The update is a full replacement of the spec plus an owned-metadata apply:
+// the operator owns the whole spec of the generated object (it is the only
+// writer that may touch it), while labels and annotations go through
+// applyOwnedMetadata so keys stamped by other controllers (external-dns,
+// cert-manager, …) survive.
 func (r *GarageBucketReconciler) applyWebsiteExposureResource(
 	ctx context.Context,
 	bucket *garagev1beta1.GarageBucket,
-	cluster *garagev1beta2.GarageCluster,
 	desired client.Object,
 ) error {
-	if bucket.Namespace == cluster.Namespace {
-		if err := controllerutil.SetControllerReference(bucket, desired, r.Scheme); err != nil {
-			return fmt.Errorf("setting controller reference: %w", err)
-		}
+	if err := controllerutil.SetControllerReference(bucket, desired, r.Scheme); err != nil {
+		return fmt.Errorf("setting controller reference: %w", err)
 	}
-
 	existing := desired.DeepCopyObject().(client.Object)
 	err := r.Get(ctx, types.NamespacedName{Name: desired.GetName(), Namespace: desired.GetNamespace()}, existing)
 	if k8errors.IsNotFound(err) {
@@ -504,30 +760,14 @@ func (r *GarageBucketReconciler) applyWebsiteExposureResource(
 	if err != nil {
 		return err
 	}
-	if !isWebsiteExposureOwned(existing, bucket, cluster) {
-		return fmt.Errorf("refusing to mutate website exposure resource %s/%s because it is not owned by GarageBucket UID %s",
+	if !metav1.IsControlledBy(existing, bucket) {
+		return fmt.Errorf("refusing to update website exposure resource %s/%s because it is not owned by GarageBucket UID %s",
 			existing.GetNamespace(), existing.GetName(), bucket.UID)
 	}
-	// A cross-namespace object created before the UID marker existed (or whose
-	// label was stripped) is claimed on update so later reconciles and the
-	// cluster-gone deletion path keep recognizing it.
-	if bucket.Namespace != cluster.Namespace && existing.GetLabels()[labelWebsiteExposureOwner] == "" {
-		if existing.GetLabels() == nil {
-			existing.SetLabels(map[string]string{})
-		}
-		existing.GetLabels()[labelWebsiteExposureOwner] = string(bucket.UID)
-	}
-
 	switch d := desired.(type) {
 	case *networkingv1.Ingress:
 		e := existing.(*networkingv1.Ingress)
 		e.OwnerReferences = d.OwnerReferences
-		if e.Labels == nil {
-			e.Labels = map[string]string{}
-		}
-		for k, v := range d.Labels {
-			e.Labels[k] = v
-		}
 		e.Spec = d.Spec
 		if err := r.Update(ctx, e); err != nil {
 			return fmt.Errorf("updating Ingress: %w", err)
@@ -536,12 +776,8 @@ func (r *GarageBucketReconciler) applyWebsiteExposureResource(
 	case *gatewayv1.HTTPRoute:
 		e := existing.(*gatewayv1.HTTPRoute)
 		e.OwnerReferences = d.OwnerReferences
-		if e.Labels == nil {
-			e.Labels = map[string]string{}
-		}
-		for k, v := range d.Labels {
-			e.Labels[k] = v
-		}
+		// The route status is owned by the Gateway controller; only the spec
+		// (and metadata) is the operator's to write.
 		e.Spec = d.Spec
 		if err := r.Update(ctx, e); err != nil {
 			return fmt.Errorf("updating HTTPRoute: %w", err)
@@ -552,35 +788,22 @@ func (r *GarageBucketReconciler) applyWebsiteExposureResource(
 	}
 }
 
-// cleanupWebsiteExposureOnDeletion removes the exposure resource when the
-// bucket is deleted through a path that does not run the full finalize
-// (deletionPolicy: Retain, COSI retain). The cluster namespace is derived
-// from spec.clusterRef, so cleanup works even when the cluster object is
-// gone or deleting: same-namespace exposures are additionally garbage
-// collected via their owner reference, but cross-namespace ones have none.
-// A returned error must retain the bucket finalizer and retry — leaving it
-// behind would orphan the exposure.
-func (r *GarageBucketReconciler) cleanupWebsiteExposureOnDeletion(ctx context.Context, bucket *garagev1beta1.GarageBucket) error {
-	clusterNamespace := bucket.Spec.ClusterRef.Namespace
-	if clusterNamespace == "" {
-		clusterNamespace = bucket.Namespace
+// deleteWebsiteExposureResource removes both possible exposure resources of
+// the bucket. The resources live in the bucket's own namespace and carry a
+// controller owner reference, so Kubernetes garbage collection already
+// removes them with the bucket; this call additionally covers the
+// spec-removal case (bucket still alive) and makes the deletion explicit and
+// idempotent on every deletion path. Foreign objects are left untouched.
+func (r *GarageBucketReconciler) deleteWebsiteExposureResource(ctx context.Context, bucket *garagev1beta1.GarageBucket) error {
+	if err := r.deleteWebsiteExposureIngress(ctx, bucket); err != nil {
+		return err
 	}
-	return r.deleteWebsiteExposureResource(ctx, bucket, clusterNamespace)
+	return r.deleteWebsiteExposureRoute(ctx, bucket)
 }
 
-// deleteWebsiteExposureResource removes the exposure resource when
-// spec.websiteExposure is unset or the bucket is being deleted. Foreign
-// objects are left untouched. When bucket and cluster share a namespace,
-// Kubernetes garbage collection also removes the controller-owned resource on
-// bucket deletion; this call covers the cross-namespace case, where no owner
-// reference can be set (ownership is recognized via the durable UID label),
-// and the spec-removal case. namespace is the cluster's namespace (see
-// websiteExposureNamespace).
-func (r *GarageBucketReconciler) deleteWebsiteExposureResource(
-	ctx context.Context,
-	bucket *garagev1beta1.GarageBucket,
-	namespace string,
-) error {
+// deleteWebsiteExposureIngress removes the owned Ingress when it is not the
+// kind the spec asks for (spec removal or a switch to gateway).
+func (r *GarageBucketReconciler) deleteWebsiteExposureIngress(ctx context.Context, bucket *garagev1beta1.GarageBucket) error {
 	// A bucket that never had a website exposure has nothing to clean up.
 	// The status record is the durable marker (the spec field is cleared when
 	// the exposure is removed), so both being unset means no resource was
@@ -590,14 +813,10 @@ func (r *GarageBucketReconciler) deleteWebsiteExposureResource(
 	}
 
 	name := websiteExposureResourceName(bucket)
-	cluster := &garagev1beta2.GarageCluster{
-		ObjectMeta: metav1.ObjectMeta{Namespace: namespace},
-	}
-
 	ingress := &networkingv1.Ingress{}
-	err := r.Get(ctx, types.NamespacedName{Name: name, Namespace: namespace}, ingress)
+	err := r.Get(ctx, types.NamespacedName{Name: name, Namespace: bucket.Namespace}, ingress)
 	if err == nil {
-		if isWebsiteExposureOwned(ingress, bucket, cluster) {
+		if metav1.IsControlledBy(ingress, bucket) {
 			logf.FromContext(ctx).Info("Deleting website exposure Ingress", "name", name)
 			if err := r.Delete(ctx, ingress); err != nil && !k8errors.IsNotFound(err) {
 				return fmt.Errorf("deleting Ingress: %w", err)
@@ -606,28 +825,45 @@ func (r *GarageBucketReconciler) deleteWebsiteExposureResource(
 	} else if !k8errors.IsNotFound(err) {
 		return err
 	}
+	return nil
+}
 
-	if r.gatewayAPIAvailable() {
-		route := &gatewayv1.HTTPRoute{}
-		err := r.Get(ctx, types.NamespacedName{Name: name, Namespace: namespace}, route)
-		if err == nil {
-			if isWebsiteExposureOwned(route, bucket, cluster) {
-				logf.FromContext(ctx).Info("Deleting website exposure HTTPRoute", "name", name)
-				if err := r.Delete(ctx, route); err != nil && !k8errors.IsNotFound(err) {
-					return fmt.Errorf("deleting HTTPRoute: %w", err)
-				}
+// deleteWebsiteExposureRoute removes the owned HTTPRoute when it is not the
+// kind the spec asks for (spec removal or a switch to ingress). It is a
+// no-op when Gateway API is unavailable: the route cannot even be listed.
+func (r *GarageBucketReconciler) deleteWebsiteExposureRoute(ctx context.Context, bucket *garagev1beta1.GarageBucket) error {
+	if !r.gatewayAPIEnabled() {
+		return nil
+	}
+	if bucket.Spec.WebsiteExposure == nil && bucket.Status.WebsiteExposure == nil {
+		return nil
+	}
+
+	name := websiteExposureResourceName(bucket)
+	route := &gatewayv1.HTTPRoute{}
+	err := r.Get(ctx, types.NamespacedName{Name: name, Namespace: bucket.Namespace}, route)
+	if err == nil {
+		if metav1.IsControlledBy(route, bucket) {
+			logf.FromContext(ctx).Info("Deleting website exposure HTTPRoute", "name", name)
+			if err := r.Delete(ctx, route); err != nil && !k8errors.IsNotFound(err) {
+				return fmt.Errorf("deleting HTTPRoute: %w", err)
 			}
-		} else if !k8errors.IsNotFound(err) {
-			return err
 		}
+	} else if !k8errors.IsNotFound(err) {
+		return err
 	}
 	return nil
 }
 
-// gatewayAPIAvailable probes the REST mapper for the HTTPRoute CRD, the same
-// pattern as monitoringCRDExists, so no informer is started when the CRD is
-// absent.
-func (r *GarageBucketReconciler) gatewayAPIAvailable() bool {
+// gatewayAPIEnabled reports whether the operator may create HTTPRoutes:
+// the --enable-gateway-api flag (or ENABLE_GATEWAY_API env var) must be set
+// AND the Gateway API CRDs must be installed, probed through the REST mapper
+// (the same pattern as monitoringCRDExists) so no informer is started when
+// the CRD is absent.
+func (r *GarageBucketReconciler) gatewayAPIEnabled() bool {
+	if !r.EnableGatewayAPI {
+		return false
+	}
 	mapper := r.RESTMapper()
 	if mapper == nil {
 		return false

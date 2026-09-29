@@ -142,6 +142,7 @@ rules:
   - patch
   - update
   - watch
+{{- if .Values.gatewayAPI.enabled }}
 # Gateway API HTTPRoutes for website-enabled buckets (spec.websiteExposure)
 - apiGroups:
   - gateway.networking.k8s.io
@@ -155,6 +156,7 @@ rules:
   - patch
   - update
   - watch
+{{- end }}
 # Ingress resources for website-enabled buckets (spec.websiteExposure)
 - apiGroups:
   - networking.k8s.io

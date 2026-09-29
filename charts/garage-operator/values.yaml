@@ -321,6 +321,17 @@ watchNamespaces: []
 # Only meaningful when watchNamespaces is non-empty; otherwise has no effect.
 watchAnyNamespace: false
 
+# Gateway API support for bucket website exposure (spec.websiteExposure.gateway).
+# When enabled, the operator renders --enable-gateway-api and its RBAC rules
+# for gateway.networking.k8s.io/httproutes. The Gateway API CRDs must be
+# installed separately (the operator never creates them); without them the
+# operator reports a GatewayAPIUnavailable condition and does not create
+# HTTPRoutes. Ingress exposure (spec.websiteExposure.ingress) is always
+# available and is not affected by this setting.
+gatewayAPI:
+  # -- Enable Gateway API support (HTTPRoute website exposure)
+  enabled: false
+
 # COSI (Container Object Storage Interface) driver configuration
 cosi:
   # -- Enable COSI driver for Kubernetes-native object storage provisioning

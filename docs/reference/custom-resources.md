@@ -268,11 +268,15 @@ must be configured through S3 APIs. `lifecycle` supports Garage's subset of
 S3 expiration and incomplete-multipart rules and is evaluated asynchronously
 by Garage's lifecycle worker. `keyPermissions` and
 `GarageKey.spec.bucketPermissions` are equivalent declaration directions and
-are merged when both describe the same grant. `websiteExposure` creates an
+are merged when both describe the same grant. `websiteExposure` (requires `website.enabled`) creates an
 `Ingress` or a Gateway API `HTTPRoute` (exactly one of the two) in the
-cluster's namespace that routes `<globalAlias><webApi.rootDomain>` — or an
-explicit `host` — to the cluster web API Service; `tlsSecretName` fills the
-Ingress TLS section and is ignored for `HTTPRoute`s.
+**bucket's** namespace that routes the canonical
+`<globalAlias><webApi.rootDomain>` — or any listed `hostnames` — to the
+cluster web API Service (`<cluster>-gateway` for unified clusters) or an
+explicit `backendRef` override. Ingress is same-namespace only; an
+HTTPRoute crosses namespaces through a Gateway API `ReferenceGrant` in the
+cluster's namespace. `ingress.tlsSecretName` fills the Ingress TLS section
+and is ignored for `HTTPRoute`s.
 
 Bucket and key references can name a namespace; cross-namespace grants must be
 approved by a `GarageReferenceGrant` in the cluster's namespace.
@@ -289,8 +293,9 @@ Garage cluster or storage can still make the data unavailable.
 bucket. `size`, incomplete-upload counters, `quotaUsage`, `websiteEnabled`,
 `websiteUrl`, and `websiteConfig` report observed state. `keys`,
 `localAliases`, and `lifecycleRules` are read-back summaries.
-`websiteExposure` records the exposed resource (`type`, `name`, `namespace`,
-`host`, `ready`) when `spec.websiteExposure` is set. The
+`websiteExposure` records the exposed resource (`type`, `name`, `hostnames`,
+and, for an HTTPRoute, the per-parent `Accepted`/`ResolvedRefs`/`Ready`
+states) when `spec.websiteExposure` is set. The
 `managedGlobalAlias`, `pendingGlobalAlias`, `managedLocalAliases`, and
 `managedKeyGrants` fields are controller ownership records used for crash-safe
 replacement and revocation; do not edit them. Inspect the `Ready`,
