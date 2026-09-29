@@ -47,9 +47,10 @@ spec:
   # Expose the website at <globalAlias><webApi.rootDomain> through an
   # Ingress created in the bucket's namespace (the backend Service must
   # therefore live there too — same namespace as the cluster). Exactly one
-  # of ingress/gateway.
+  # of ingress/gateway. An Ingress cannot rewrite the Host header, so
+  # only the canonical hostname or the global alias are accepted.
   websiteExposure:
-    # hostnames: [site.example.com, www.example.com]
+    # hostnames: [site.example.com, site]
     ingress:
       ingressClassName: traefik
       # tlsSecretName: website-tls

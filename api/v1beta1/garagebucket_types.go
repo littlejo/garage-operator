@@ -188,12 +188,22 @@ type WebsiteConfig struct {
 // <globalAlias><webApi.rootDomain>. For an HTTPRoute, a hostname that is
 // neither canonical nor equal to the global alias is additionally matched
 // with a URLRewrite filter rewriting the Host header to the canonical host.
+// For an Ingress, which has no such rewrite filter, only the canonical
+// hostname and the global alias are accepted; any other hostname is refused
+// on the WebsiteExposed condition.
 type WebsiteExposureConfig struct {
 	// Hostnames are the external hostnames the exposure routes on. When
 	// empty, the operator uses the single canonical hostname
 	// <globalAlias><webApi.rootDomain>. Wildcards and duplicates are not
 	// supported (duplicates are rejected by the validating webhook; the CRD
 	// schema cannot express uniqueItems).
+	//
+	// For an HTTPRoute any hostname is accepted: a hostname that is neither
+	// canonical nor the global alias gets a URLRewrite filter rewriting the
+	// Host header back to the canonical host, so Garage still resolves it to
+	// this bucket. For an Ingress, only the canonical hostname and the
+	// global alias are accepted — an Ingress cannot rewrite the Host header,
+	// so any other hostname is refused on the WebsiteExposed condition.
 	// +kubebuilder:validation:MaxItems=16
 	// +kubebuilder:validation:Items:Type=string
 	// +kubebuilder:validation:Items:MinLength=1

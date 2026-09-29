@@ -245,7 +245,9 @@ func TestWebsiteExposureIngressExplicitHostnamesAndTLS(t *testing.T) {
 	bucket := websiteExposureTestBucket("garage-ns")
 	cluster := websiteExposureTestCluster()
 	bucket.Spec.WebsiteExposure = &garagev1beta1.WebsiteExposureConfig{
-		Hostnames: []string{"site.example.com", "www.example.com"},
+		// Both hostnames resolve to the bucket without a Host rewrite: the
+		// canonical <alias><rootDomain> form and the bare alias.
+		Hostnames: []string{"site.example.com", "site"},
 		Ingress: &garagev1beta1.WebsiteExposureIngressConfig{
 			TLSSecretName: "site-tls",
 			Annotations:   map[string]string{"cert-manager.io/cluster-issuer": "letsencrypt"},
@@ -269,7 +271,7 @@ func TestWebsiteExposureIngressExplicitHostnamesAndTLS(t *testing.T) {
 	}
 	if len(ingress.Spec.Rules) != 2 ||
 		ingress.Spec.Rules[0].Host != "site.example.com" ||
-		ingress.Spec.Rules[1].Host != "www.example.com" {
+		ingress.Spec.Rules[1].Host != "site" {
 		t.Fatalf("rules = %+v, want one rule per hostname", ingress.Spec.Rules)
 	}
 	if ingress.Annotations["cert-manager.io/cluster-issuer"] != "letsencrypt" {
@@ -301,6 +303,36 @@ func TestWebsiteExposureIngressCrossNamespaceRejected(t *testing.T) {
 		t.Fatalf("condition = %+v, want False/ReconcileFailed", cond)
 	}
 	if !strings.Contains(cond.Message, "cross namespaces") {
+		t.Fatalf("condition message = %q", cond.Message)
+	}
+}
+
+// TestWebsiteExposureIngressNonCanonicalHostRejected proves that a hostname
+// which is neither the canonical <alias><rootDomain> form nor the bare alias
+// is refused for an Ingress (no Host rewrite exists): the condition carries
+// the reason and no Ingress is created.
+func TestWebsiteExposureIngressNonCanonicalHostRejected(t *testing.T) {
+	ctx := context.Background()
+	bucket := websiteExposureTestBucket("garage-ns")
+	cluster := websiteExposureTestCluster()
+	bucket.Spec.WebsiteExposure = &garagev1beta1.WebsiteExposureConfig{
+		Hostnames: []string{"site.example.com", "www.example.com"},
+		Ingress:   &garagev1beta1.WebsiteExposureIngressConfig{},
+	}
+	c, scheme := websiteExposureTestClient(t, false, bucket, cluster)
+	r := &GarageBucketReconciler{Client: c, Scheme: scheme}
+
+	if _, err := r.reconcileWebsiteExposure(ctx, bucket, cluster); err != nil {
+		t.Fatalf("the refusal must surface on the condition, not error: %v", err)
+	}
+	if err := c.Get(ctx, types.NamespacedName{Name: "site-website", Namespace: bucket.Namespace}, &networkingv1.Ingress{}); !k8errors.IsNotFound(err) {
+		t.Fatalf("no Ingress may be created with a non-canonical hostname, got err = %v", err)
+	}
+	cond := websiteExposureCondition(t, bucket)
+	if cond.Status != metav1.ConditionFalse || cond.Reason != garagev1beta1.ReasonReconcileFailed {
+		t.Fatalf("condition = %+v, want False/ReconcileFailed", cond)
+	}
+	if !strings.Contains(cond.Message, "www.example.com") || !strings.Contains(cond.Message, "Ingress cannot rewrite") {
 		t.Fatalf("condition message = %q", cond.Message)
 	}
 }

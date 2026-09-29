@@ -542,7 +542,9 @@ the cluster's web API Service. Both require `spec.website.enabled: true`
   the full Host as the alias (`host_to_bucket(host).unwrap_or(host)`), a host
   equal to the global alias also resolves; for an **HTTPRoute** a host that is
   neither canonical nor the bare alias gets a `URLRewrite` filter rewriting
-  the Host header to the canonical host. A not-yet-recorded alias defers the
+  the Host header to the canonical host, while an **Ingress** (no rewrite
+  filter) only accepts the canonical host or the bare alias and refuses any
+  other hostname on the condition. A not-yet-recorded alias defers the
   derived host (`WaitingForAlias`, short requeue).
 - `tlsSecretName` lives under `websiteExposure.ingress` and fills the Ingress
   `spec.tls` section only (HTTPRoute TLS is on the parent Gateway). Default

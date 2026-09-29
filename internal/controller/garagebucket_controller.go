@@ -2101,7 +2101,7 @@ func (r *GarageBucketReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Owns(&networkingv1.Ingress{}).
 		Named("garagebucket")
 	if r.EnableGatewayAPI && r.RESTMapper() != nil {
-		if _, err := r.RESTMapper().RESTMapping(schema.GroupKind{Group: "gateway.networking.k8s.io", Kind: "HTTPRoute"}); err == nil {
+		if _, err := r.RESTMapper().RESTMapping(schema.GroupKind{Group: "gateway.networking.k8s.io", Kind: websiteExposureResourceHTTPRoute}); err == nil {
 			bldr = bldr.Owns(&gatewayv1.HTTPRoute{})
 		}
 	}

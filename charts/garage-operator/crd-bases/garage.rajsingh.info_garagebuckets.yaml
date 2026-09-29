@@ -939,6 +939,13 @@ spec:
                       <globalAlias><webApi.rootDomain>. Wildcards and duplicates are not
                       supported (duplicates are rejected by the validating webhook; the CRD
                       schema cannot express uniqueItems).
+
+                      For an HTTPRoute any hostname is accepted: a hostname that is neither
+                      canonical nor the global alias gets a URLRewrite filter rewriting the
+                      Host header back to the canonical host, so Garage still resolves it to
+                      this bucket. For an Ingress, only the canonical hostname and the
+                      global alias are accepted — an Ingress cannot rewrite the Host header,
+                      so any other hostname is refused on the WebsiteExposed condition.
                     items:
                       type: string
                     maxItems: 16

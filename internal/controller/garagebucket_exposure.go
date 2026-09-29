@@ -44,9 +44,10 @@ import (
 // +kubebuilder:rbac:groups=gateway.networking.k8s.io,resources=httproutes,verbs=create;delete;get;list;patch;update;watch
 
 const (
-	// websiteExposureResourceIngress and websiteExposureResourceHTTPRoute
-	// are the status.websiteExposure.type values.
-	websiteExposureResourceIngress  = "Ingress"
+	// websiteExposureResourceIngress and websiteExposureResourceHTTPRoute are
+	// the status.websiteExposure.type values. websiteExposureResourceHTTPRoute
+	// doubles as the Gateway API kind name probed for CRD availability.
+	websiteExposureResourceIngress   = "Ingress"
 	websiteExposureResourceHTTPRoute = "HTTPRoute"
 
 	// HTTPRoute route-status condition types (gateway API v1).
@@ -56,10 +57,6 @@ const (
 
 	// websiteExposureServiceKind is the default backendRef kind.
 	websiteExposureServiceKind = "Service"
-
-	// websiteExposureHTTPRouteKind is the Gateway API kind probed for CRD
-	// availability.
-	websiteExposureHTTPRouteKind = "HTTPRoute"
 )
 
 // websiteExposureResourceName is the name of the operator-generated Ingress
@@ -105,10 +102,11 @@ func canonicalWebsiteHost(cluster *garagev1beta2.GarageCluster, alias string) (s
 // Garage's web server falls back to the full Host as the bucket alias
 // (host_to_bucket(host).unwrap_or(host)), so a hostname equal to the global
 // alias also resolves to the bucket without the rootDomain suffix; the
-// canonical form is still preferred. For an Ingress every requested hostname
-// is simply a rule host. For an HTTPRoute, a hostname that is neither
-// canonical nor the alias gets a URLRewrite filter rewriting the Host header
-// to the canonical host so the request still resolves to the bucket.
+// canonical form is still preferred. For an Ingress, hostnames that would
+// not resolve as-is (see websiteExposureNeedsRewrite) are refused by
+// buildIngress. For an HTTPRoute, a hostname that is neither canonical nor
+// the alias gets a URLRewrite filter rewriting the Host header to the
+// canonical host so the request still resolves to the bucket.
 func websiteExposureHostnames(cluster *garagev1beta2.GarageCluster, exposure *garagev1beta1.WebsiteExposureConfig, alias string) ([]string, error) {
 	if len(exposure.Hostnames) > 0 {
 		return exposure.Hostnames, nil
@@ -171,8 +169,6 @@ func (r *GarageBucketReconciler) reconcileWebsiteExposure(
 		return ctrl.Result{}, nil
 	}
 
-	alias := bucket.Status.GlobalAlias
-
 	// Ingress and HTTPRoute share the generated name, so exactly one may
 	// exist: when the spec switches kinds (or names neither, handled above),
 	// the previously generated resource of the other kind is removed.
@@ -186,10 +182,10 @@ func (r *GarageBucketReconciler) reconcileWebsiteExposure(
 		}
 	}
 
-	// WaitingForAlias is reported when the canonical host cannot be derived:
-	// either the hostnames are not explicit, or (HTTPRoute only) a non-
-	// canonical explicit hostname needs a rewrite target that the alias
-	// would provide.
+	// WaitingForAlias is reported while the bucket's global alias is not
+	// recorded yet: both resource kinds derive the canonical host from it
+	// (Ingress: to verify each hostname resolves to the bucket; HTTPRoute:
+	// as the URLRewrite target for non-canonical hostnames).
 	waitingForAlias := func(err error) (ctrl.Result, bool) {
 		if !errors.Is(err, errWebsiteExposureWaitingForAlias) {
 			return ctrl.Result{}, false
@@ -213,17 +209,6 @@ func (r *GarageBucketReconciler) reconcileWebsiteExposure(
 		return ctrl.Result{RequeueAfter: RequeueAfterShort}, true
 	}
 
-	if len(exposure.Hostnames) == 0 {
-		// Only the derived host needs the alias; explicit hostnames work
-		// before the alias is recorded.
-		if _, err := canonicalWebsiteHost(cluster, alias); err != nil {
-			if result, done := waitingForAlias(err); done {
-				return result, nil
-			}
-			return r.finishWebsiteExposure(ctx, bucket, cluster, oldStatus, nil, err, "ReconcileFailed", err.Error())
-		}
-	}
-
 	if exposure.Gateway != nil {
 		if !r.gatewayAPIEnabled() {
 			condition := &metav1.Condition{
@@ -234,7 +219,7 @@ func (r *GarageBucketReconciler) reconcileWebsiteExposure(
 				ObservedGeneration: bucket.Generation,
 			}
 			status := &garagev1beta1.WebsiteExposureStatus{
-				Type: "HTTPRoute",
+				Type: websiteExposureResourceHTTPRoute,
 				Name: websiteExposureResourceName(bucket),
 			}
 			if err := r.persistWebsiteExposureStatus(ctx, bucket, oldStatus, status, condition); err != nil {
@@ -247,22 +232,22 @@ func (r *GarageBucketReconciler) reconcileWebsiteExposure(
 			if result, done := waitingForAlias(err); done {
 				return result, nil
 			}
-			return r.finishWebsiteExposure(ctx, bucket, cluster, oldStatus, nil, err, "ReconcileFailed", err.Error())
+			return r.finishWebsiteExposure(ctx, bucket, oldStatus, nil, err, "ReconcileFailed", err.Error())
 		}
 		if err := r.applyWebsiteExposureResource(ctx, bucket, route); err != nil {
-			return r.finishWebsiteExposure(ctx, bucket, cluster, oldStatus, nil, err, "ReconcileFailed", err.Error())
+			return r.finishWebsiteExposure(ctx, bucket, oldStatus, nil, err, "ReconcileFailed", err.Error())
 		}
 		fresh := &gatewayv1.HTTPRoute{}
 		if err := r.Get(ctx, types.NamespacedName{Name: route.Name, Namespace: route.Namespace}, fresh); err != nil {
-			return r.finishWebsiteExposure(ctx, bucket, cluster, oldStatus, nil, err, "ReconcileFailed", err.Error())
+			return r.finishWebsiteExposure(ctx, bucket, oldStatus, nil, err, "ReconcileFailed", err.Error())
 		}
 		ready, message := websiteExposureRouteReady(fresh)
 		status := websiteExposureStatusFromRoute(fresh)
 		if ready {
-			return r.finishWebsiteExposure(ctx, bucket, cluster, oldStatus, status, nil, "Exposed",
+			return r.finishWebsiteExposure(ctx, bucket, oldStatus, status, nil, "Exposed",
 				fmt.Sprintf("website exposed via HTTPRoute %s/%s", fresh.Namespace, fresh.Name))
 		}
-		result, err := r.finishWebsiteExposure(ctx, bucket, cluster, oldStatus, status, nil, "NotReady", message)
+		result, err := r.finishWebsiteExposure(ctx, bucket, oldStatus, status, nil, "NotReady", message)
 		if err != nil {
 			return result, err
 		}
@@ -274,16 +259,19 @@ func (r *GarageBucketReconciler) reconcileWebsiteExposure(
 
 	ingress, err := r.buildIngress(bucket, clusterNamespace, cluster, exposure)
 	if err != nil {
-		return r.finishWebsiteExposure(ctx, bucket, cluster, oldStatus, nil, err, "ReconcileFailed", err.Error())
+		if result, done := waitingForAlias(err); done {
+			return result, nil
+		}
+		return r.finishWebsiteExposure(ctx, bucket, oldStatus, nil, err, "ReconcileFailed", err.Error())
 	}
 	if err := r.applyWebsiteExposureResource(ctx, bucket, ingress); err != nil {
-		return r.finishWebsiteExposure(ctx, bucket, cluster, oldStatus, nil, err, "ReconcileFailed", err.Error())
+		return r.finishWebsiteExposure(ctx, bucket, oldStatus, nil, err, "ReconcileFailed", err.Error())
 	}
 	fresh := &networkingv1.Ingress{}
 	if err := r.Get(ctx, types.NamespacedName{Name: ingress.Name, Namespace: ingress.Namespace}, fresh); err != nil {
-		return r.finishWebsiteExposure(ctx, bucket, cluster, oldStatus, nil, err, "ReconcileFailed", err.Error())
+		return r.finishWebsiteExposure(ctx, bucket, oldStatus, nil, err, "ReconcileFailed", err.Error())
 	}
-	return r.finishWebsiteExposure(ctx, bucket, cluster, oldStatus, websiteExposureStatusFromIngress(fresh), nil,
+	return r.finishWebsiteExposure(ctx, bucket, oldStatus, websiteExposureStatusFromIngress(fresh), nil,
 		"Exposed", fmt.Sprintf("website exposed via Ingress %s/%s", fresh.Namespace, fresh.Name))
 }
 
@@ -296,7 +284,7 @@ func websiteExposureStatusFromRoute(route *gatewayv1.HTTPRoute) *garagev1beta1.W
 		hostnames = append(hostnames, string(h))
 	}
 	status := &garagev1beta1.WebsiteExposureStatus{
-		Type:      "HTTPRoute",
+		Type:      websiteExposureResourceHTTPRoute,
 		Name:      route.Name,
 		Hostnames: hostnames,
 	}
@@ -306,11 +294,11 @@ func websiteExposureStatusFromRoute(route *gatewayv1.HTTPRoute) *garagev1beta1.W
 		}
 		for _, cond := range parent.Conditions {
 			switch cond.Type {
-			case "Accepted":
+			case websiteExposureCondAccepted:
 				parentStatus.Accepted = cond.Status == metav1.ConditionTrue
-			case "ResolvedRefs":
+			case websiteExposureCondResolvedRef:
 				parentStatus.ResolvedRefs = cond.Status == metav1.ConditionTrue
-			case "Ready":
+			case websiteExposureCondReady:
 				parentStatus.Ready = cond.Status == metav1.ConditionTrue
 				if cond.Status != metav1.ConditionTrue && cond.Message != "" {
 					parentStatus.Message = cond.Message
@@ -333,7 +321,7 @@ func websiteExposureStatusFromIngress(ingress *networkingv1.Ingress) *garagev1be
 		}
 	}
 	return &garagev1beta1.WebsiteExposureStatus{
-		Type:      "Ingress",
+		Type:      websiteExposureResourceIngress,
 		Name:      ingress.Name,
 		Hostnames: hostnames,
 	}
@@ -350,17 +338,17 @@ func websiteExposureRouteReady(route *gatewayv1.HTTPRoute) (ready bool, message 
 	}
 	for _, parent := range route.Status.Parents {
 		name := websiteExposureParentName(parent)
-		accepted := websiteExposureParentCond(parent, "Accepted")
+		accepted := websiteExposureParentCond(parent, websiteExposureCondAccepted)
 		if accepted == nil {
 			return false, "the parent " + name + " has not reported an Accepted condition yet"
 		}
 		if accepted.Status != metav1.ConditionTrue {
 			return false, "the parent " + name + " does not accept the route: " + accepted.Message
 		}
-		if resolved := websiteExposureParentCond(parent, "ResolvedRefs"); resolved != nil && resolved.Status != metav1.ConditionTrue {
+		if resolved := websiteExposureParentCond(parent, websiteExposureCondResolvedRef); resolved != nil && resolved.Status != metav1.ConditionTrue {
 			return false, "the route's backend reference is not resolved on " + name + ": " + resolved.Message
 		}
-		if readyParent := websiteExposureParentCond(parent, "Ready"); readyParent != nil && readyParent.Status != metav1.ConditionTrue {
+		if readyParent := websiteExposureParentCond(parent, websiteExposureCondReady); readyParent != nil && readyParent.Status != metav1.ConditionTrue {
 			return false, "the route is not ready on " + name + ": " + readyParent.Message
 		}
 	}
@@ -393,7 +381,6 @@ func websiteExposureParentCond(parent gatewayv1.RouteParentStatus, condType stri
 func (r *GarageBucketReconciler) finishWebsiteExposure(
 	ctx context.Context,
 	bucket *garagev1beta1.GarageBucket,
-	cluster *garagev1beta2.GarageCluster,
 	oldStatus *garagev1beta1.GarageBucketStatus,
 	status *garagev1beta1.WebsiteExposureStatus,
 	err error,
@@ -486,7 +473,7 @@ func websiteExposureBackendRef(
 	ref *garagev1beta1.WebsiteExposureBackendReference,
 ) gatewayv1.BackendObjectReference {
 	group := ""
-	kind := "Service"
+	kind := websiteExposureServiceKind
 	namespace := ""
 	name := websiteExposureBackend(cluster)
 	if ref != nil {
@@ -500,16 +487,15 @@ func websiteExposureBackendRef(
 		namespace = clusterNamespace
 	}
 	port := getWebPort(cluster)
-	portNumber := gatewayv1.PortNumber(port)
 	backref := gatewayv1.BackendObjectReference{
 		Name: gatewayv1.ObjectName(name),
-		Port: &portNumber,
+		Port: &port,
 	}
 	if group != "" {
 		g := gatewayv1.Group(group)
 		backref.Group = &g
 	}
-	if kind != "Service" {
+	if kind != websiteExposureServiceKind {
 		k := gatewayv1.Kind(kind)
 		backref.Kind = &k
 	}
@@ -531,7 +517,7 @@ func ingressBackendName(bucket *garagev1beta1.GarageBucket, cluster *garagev1bet
 	if ref == nil {
 		return websiteExposureBackend(cluster), nil
 	}
-	if ref.Group != "" || (ref.Kind != "" && ref.Kind != "Service") {
+	if ref.Group != "" || (ref.Kind != "" && ref.Kind != websiteExposureServiceKind) {
 		return "", fmt.Errorf("websiteExposure.backendRef must reference a core/v1 Service for an Ingress (got kind %q group %q)", ref.Kind, ref.Group)
 	}
 	if ref.Namespace != "" && ref.Namespace != bucket.Namespace {
@@ -569,9 +555,24 @@ func (r *GarageBucketReconciler) buildIngress(
 	if err != nil {
 		return nil, err
 	}
+	canonical, err := canonicalWebsiteHost(cluster, bucket.Status.GlobalAlias)
+	if err != nil {
+		return nil, err
+	}
 	hostnames, err := websiteExposureHostnames(cluster, exposure, bucket.Status.GlobalAlias)
 	if err != nil {
 		return nil, err
+	}
+	// An Ingress has no host-rewrite filter: every hostname it routes on
+	// reaches Garage verbatim, so each one must already resolve to the
+	// bucket — the canonical <alias><rootDomain> form or the bare alias.
+	// Any other hostname is rejected (surfaced on the condition) rather
+	// than silently mis-routed; an HTTPRoute can carry it instead, because
+	// its URLRewrite filter rewrites the Host back to the canonical host.
+	for _, host := range hostnames {
+		if websiteExposureNeedsRewrite(host, canonical, bucket.Status.GlobalAlias) {
+			return nil, fmt.Errorf("ingress hostname %q does not resolve to the bucket: an Ingress cannot rewrite the Host header, so only the canonical hostname %q or the global alias %q are supported (use websiteExposure.gateway to route other hostnames)", host, canonical, bucket.Status.GlobalAlias)
+		}
 	}
 
 	pathType := networkingv1.PathTypePrefix
@@ -868,6 +869,6 @@ func (r *GarageBucketReconciler) gatewayAPIEnabled() bool {
 	if mapper == nil {
 		return false
 	}
-	_, err := mapper.RESTMapping(schema.GroupKind{Group: "gateway.networking.k8s.io", Kind: "HTTPRoute"})
+	_, err := mapper.RESTMapping(schema.GroupKind{Group: "gateway.networking.k8s.io", Kind: websiteExposureResourceHTTPRoute})
 	return err == nil
 }

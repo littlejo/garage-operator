@@ -85,7 +85,9 @@ spec:
   Because Garage falls back to the full Host as the alias, a hostname equal
   to the global alias also resolves. For an `HTTPRoute`, a hostname that is
   neither canonical nor the bare alias gets a `URLRewrite` filter rewriting
-  the Host header to the canonical host.
+  the Host header to the canonical host. For an `Ingress` (no rewrite
+  filter), only the canonical hostname and the bare alias are accepted; any
+  other hostname is refused on the `WebsiteExposed` condition.
 - `backendRef` overrides the backend Service (e.g. a cross-namespace
   `ServiceImport`). For an Ingress it must be a core/v1 Service in the
   bucket's namespace. The port is always the cluster's effective web API
@@ -123,9 +125,12 @@ reconcile in the normal (non-deleting) path:
     have to target the cluster's web Service from another namespace.
   - Hostnames are `spec.websiteExposure.hostnames` or the derived canonical
     host. While the bucket has no recorded global alias yet, the canonical
-    host cannot be derived — the condition is set
-    `False/Reason=WaitingForAlias` and the reconcile retries on the short
-    interval; explicit hostnames work before the alias is recorded.
+    host cannot be derived and the hostname-vs-canonical check cannot run —
+    the condition is set `False/Reason=WaitingForAlias` and the reconcile
+    retries on the short interval (explicit hostnames included: an Ingress
+    cannot rewrite the Host header, so every hostname must resolve to the
+    bucket as-is (canonical form or bare alias); any other hostname is
+    refused on the condition with no resource created).
   - The Ingress (one rule per hostname) routes path `/` (Prefix) to the
     cluster's web API Service in the bucket's namespace, port name `web`
     (`<cluster>-gateway` for unified clusters, `<cluster>` otherwise, or
@@ -202,8 +207,8 @@ not a `PhaseFailed` — the bucket itself is ready either way.
 
 ## Failure modes
 
-- Canonical host derivation before the alias is recorded (and no explicit
-  hostnames) → wait-and-retry condition, no partial resource.
+- Alias not recorded yet (with or without explicit hostnames) →
+  `False/WaitingForAlias` wait-and-retry condition, no partial resource.
 - Gateway API disabled or CRDs absent → `False/GatewayAPIUnavailable`, no
   error, retried at the drift interval.
 - Gateway does not accept the route, or the backend does not resolve
@@ -220,9 +225,10 @@ not a `PhaseFailed` — the bucket itself is ready either way.
 ## Test plan
 
 - Unit (envtest): Ingress create with derived canonical host, explicit
-  hostnames, `ingress.tlsSecretName`, labels/annotations merge;
-  cross-namespace Ingress refused; delete on spec removal and on the
-  ingress↔gateway switch; foreign object refusal.
+  hostnames (canonical + bare alias), `ingress.tlsSecretName`,
+  labels/annotations merge; non-canonical hostname refused on the condition
+  with no Ingress created; cross-namespace Ingress refused; delete on spec
+  removal and on the ingress↔gateway switch; foreign object refusal.
 - Unit (envtest with fake HTTPRoute): HTTPRoute create with parentRefs,
   hostnames, and the default backend; URLRewrite filter for non-canonical
   non-alias hostnames; `backendRef` override; readiness driven by simulated

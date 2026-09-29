@@ -281,7 +281,8 @@ spec:
     indexDocument: index.html
     errorDocument: error.html
   websiteExposure:
-    # hostnames: [site.example.com, www.example.com]   # default: <globalAlias><webApi.rootDomain>
+    # hostnames: [site.example.com, www.example.com]   # default: <globalAlias><webApi.rootDomain>;
+    #   for ingress only the canonical host or the global alias are accepted
     # Either ingress or gateway — not both.
     ingress:
       ingressClassName: traefik
@@ -325,9 +326,12 @@ wildcards, no duplicates). Garage resolves the bucket from the `Host`
 header and falls back to the full Host as the alias, so a hostname equal to
 the global alias also works. For an `HTTPRoute`, a hostname that is neither
 canonical nor the bare alias gets a `URLRewrite` filter rewriting the Host
-header to the canonical host. `tlsSecretName` (under `ingress`) fills the
-Ingress `spec.tls` section; for an `HTTPRoute` TLS is configured on the
-parent `Gateway`.
+header to the canonical host. For an `Ingress`, which has no such rewrite,
+only the canonical hostname and the global alias are accepted — any other
+hostname is refused on the `WebsiteExposed` condition (use a `gateway`
+exposure to route additional hostnames). `tlsSecretName` (under `ingress`)
+fills the Ingress `spec.tls` section; for an `HTTPRoute` TLS is configured
+on the parent `Gateway`.
 
 The `WebsiteExposed` condition and `status.websiteExposure` surface the
 resource (type, name, hostnames) and, for an `HTTPRoute`, the per-parent

@@ -271,9 +271,12 @@ by Garage's lifecycle worker. `keyPermissions` and
 are merged when both describe the same grant. `websiteExposure` (requires `website.enabled`) creates an
 `Ingress` or a Gateway API `HTTPRoute` (exactly one of the two) in the
 **bucket's** namespace that routes the canonical
-`<globalAlias><webApi.rootDomain>` — or any listed `hostnames` — to the
+`<globalAlias><webApi.rootDomain>` — or the listed `hostnames` — to the
 cluster web API Service (`<cluster>-gateway` for unified clusters) or an
-explicit `backendRef` override. Ingress is same-namespace only; an
+explicit `backendRef` override. An HTTPRoute accepts any listed hostname
+(non-canonical ones get a `URLRewrite` back to the canonical host); an
+Ingress only accepts the canonical host or the global alias, because it
+cannot rewrite the Host header. Ingress is same-namespace only; an
 HTTPRoute crosses namespaces through a Gateway API `ReferenceGrant` in the
 cluster's namespace. `ingress.tlsSecretName` fills the Ingress TLS section
 and is ignored for `HTTPRoute`s.
